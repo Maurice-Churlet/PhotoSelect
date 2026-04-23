@@ -257,20 +257,21 @@ def _open_in_maps(lat: float | None, lon: float | None) -> None:
     webbrowser.open(url)
 
 
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT),
+                ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
 def _get_monitor_rect(x: int, y: int) -> dict[str, int]:
     """Retourne les dimensions du moniteur contenant le point (x, y) via l'API Windows."""
     try:
-        class RECT(ctypes.Structure):
-            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-
-        class MONITORINFO(ctypes.Structure):
-            _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT),
-                        ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
-
-        class POINT(ctypes.Structure):
-            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
         user32 = ctypes.windll.user32
         pt = POINT(x, y)
         monitor = user32.MonitorFromPoint(pt, 2)  # MONITOR_DEFAULTTONEAREST
@@ -285,6 +286,47 @@ def _get_monitor_rect(x: int, y: int) -> dict[str, int]:
         }
     except Exception:
         return {"x": 0, "y": 0, "width": 1920, "height": 1080}
+
+
+def _get_all_monitors() -> list[dict[str, int]]:
+    """Retourne la liste des rectangles de tous les moniteurs connectés (triés de gauche à droite)."""
+    monitors = []
+    try:
+        user32 = ctypes.windll.user32
+        
+        # Log du nombre de moniteurs vu par le système (SM_CMONITORS = 80)
+        sys_mon_count = user32.GetSystemMetrics(80)
+        logger.info("[monitors] GetSystemMetrics(80) = %d", sys_mon_count)
+
+        def callback(hMonitor, hdcMonitor, lprcMonitor, dwData):
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if user32.GetMonitorInfoW(hMonitor, ctypes.byref(mi)):
+                rect = {
+                    "x": mi.rcMonitor.left,
+                    "y": mi.rcMonitor.top,
+                    "width": mi.rcMonitor.right - mi.rcMonitor.left,
+                    "height": mi.rcMonitor.bottom - mi.rcMonitor.top,
+                }
+                monitors.append(rect)
+                logger.info("[monitors] Callback trouvé moniteur: %s", rect)
+            return True
+
+        # On définit le type de callback et on l'instancie LOCALEMENT pour éviter les problèmes de closure
+        CMPFUNC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(RECT), ctypes.c_void_p)
+        callback_ptr = CMPFUNC(callback)
+        
+        user32.EnumDisplayMonitors(None, None, callback_ptr, None)
+    except Exception as e:
+        logger.error("Erreur enumeration moniteurs: %s", e)
+
+    if not monitors:
+        monitors = [{"x": 0, "y": 0, "width": 1920, "height": 1080}]
+
+    # Tri par X puis Y pour un ordre logique 1 (gauche) -> 2 (droite)
+    monitors.sort(key=lambda m: (m["x"], m["y"]))
+    logger.info("[monitors] %d moniteurs détectés: %s", len(monitors), monitors)
+    return monitors
 
 
 def _remove_accents(input_str: str | None) -> str:
@@ -379,6 +421,12 @@ class FullscreenViewer(tk.Toplevel):
         self.bind("<Control-r>", self._on_rotate_shortcut_right)
         self.bind("<Control-l>", self._on_rotate_shortcut_left)
         self.bind("<Control-u>", self._on_rotate_shortcut_normalize)
+        
+        self.bind("<Control-r>", self._on_rotate_shortcut_right)
+        self.bind("<Control-l>", self._on_rotate_shortcut_left)
+        self.bind("<Control-u>", self._on_rotate_shortcut_normalize)
+        
+        # Les raccourcis changement d'écran sont gérés globalement par ControlPanel.bind_all
         self.canvas.bind("<Delete>", lambda e: self.parent_app.delete_current())
         self.canvas.bind("<F2>", lambda e: self.parent_app._rename_single())
         self.canvas.bind("<Control-r>", self._on_rotate_shortcut_right)
@@ -444,17 +492,20 @@ class FullscreenViewer(tk.Toplevel):
 
     # ── Gestion plein écran multi-moniteur ────────────────────────────
 
-    def _go_fullscreen(self) -> None:
-        """Passe en plein écran sans bordure sur le moniteur courant."""
+    def _go_fullscreen(self, monitor_rect: dict[str, int] | None = None) -> None:
+        """Passe en plein écran sans bordure sur le moniteur courant ou spécifié."""
         if self._is_fullscreen:
             return
         # Sauvegarder la géométrie fenêtrée actuelle
         self._windowed_geometry = self.geometry()
         
-        # Détecter le moniteur sur lequel se trouve la fenêtre
-        cx = self.winfo_x() + self.winfo_width() // 2
-        cy = self.winfo_y() + self.winfo_height() // 2
-        mon = _get_monitor_rect(cx, cy)
+        if monitor_rect:
+            mon = monitor_rect
+        else:
+            # Détecter le moniteur sur lequel se trouve la fenêtre
+            cx = self.winfo_x() + self.winfo_width() // 2
+            cy = self.winfo_y() + self.winfo_height() // 2
+            mon = _get_monitor_rect(cx, cy)
         
         # Appliquer le plein écran sans bordure
         self.overrideredirect(True)
@@ -498,6 +549,38 @@ class FullscreenViewer(tk.Toplevel):
                 self._ctx_menu.grab_release()
             return "break"
         return None
+
+    def _move_to_monitor(self, index: int) -> str:
+        """Déplace la visionneuse sur le moniteur spécifié (0-indexed)."""
+        logger.info("[viewer] Demande de déplacement vers écran index %d", index)
+        monitors = _get_all_monitors()
+        if index < 0 or index >= len(monitors):
+            logger.warning("[viewer] Index écran %d invalide (total=%d)", index, len(monitors))
+            return "break"
+        
+        mon = monitors[index]
+        logger.info("[viewer] Déplacement vers moniteur: %s", mon)
+        was_fs = self._is_fullscreen
+        
+        # Sortir du plein écran pour pouvoir déplacer proprement
+        if was_fs:
+            self._exit_fullscreen()
+            
+        # Placement temporaire au centre du nouveau moniteur pour que _go_fullscreen le détecte
+        new_x = mon['x'] + (mon['width'] // 4)
+        new_y = mon['y'] + (mon['height'] // 4)
+        self.geometry(f"+{new_x}+{new_y}")
+        self.update_idletasks()
+        
+        if was_fs:
+            # Re-passer en plein écran sur le nouveau moniteur (en forçant le rectangle)
+            self._go_fullscreen(mon)
+            
+        # Mémoriser la position pour la persistance
+        self.parent_app.config_data["geometry_viewer"] = self.geometry()
+        self.parent_app._save_config()
+        
+        return "break"
 
     def _on_escape_key(self, _event: tk.Event | None = None) -> str | None:
         """Escape : arrête le diaporama s'il est actif, sinon quitte le plein écran."""
@@ -1811,8 +1894,12 @@ class ControlPanel(tk.Tk):
         self.bind_all("<Key-d>", self._on_global_start_slideshow_shortcut, add="+")
         self.bind_all("<Key-D>", self._on_global_start_slideshow_shortcut, add="+")
         # Raccourci P/p pour basculer entre UI principale et visionneuses
-        self.bind_all("<Key-p>", self._toggle_window_groups_focus)
         self.bind_all("<Key-P>", self._toggle_window_groups_focus)
+        
+        # Raccourcis changement d'écran pour les visionneuses (Ctrl+1, Ctrl+2, ...)
+        for i in range(1, 4):
+            self.bind_all(f"<Control-Key-{i}>", lambda e, idx=i-1: self._move_viewers_to_monitor(idx), add="+")
+            self.bind_all(f"<Control-KP_{i}>", lambda e, idx=i-1: self._move_viewers_to_monitor(idx), add="+")
 
     def _toggle_window_groups_focus(self, event: tk.Event | None = None) -> str:
         """Bascule le premier plan entre le panneau principal et le groupe des visionneuses."""
@@ -1872,6 +1959,18 @@ class ControlPanel(tk.Tk):
             except Exception:
                 pass
 
+        return "break"
+
+    def _move_viewers_to_monitor(self, index: int) -> str:
+        """Déplace toutes les visionneuses vers le moniteur spécifié (0-indexed)."""
+        logger.info("[app] Commande globale: déplacer les visionneuses vers écran %d", index + 1)
+        for v in (getattr(self, "viewer_photo", None), getattr(self, "viewer_grid", None)):
+            if v is not None:
+                try:
+                    if int(v.winfo_exists()):
+                        v._move_to_monitor(index)
+                except Exception:
+                    pass
         return "break"
 
     def _start_watcher(self) -> None:

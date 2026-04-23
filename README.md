@@ -116,6 +116,7 @@ Antisèche des commandes utiles, regroupées par contexte.
 | **`F11`** / **`F12`** | Bascule plein écran / fenêtré. |
 | **`Double-Clic`** | Bascule plein écran / fenêtré. |
 | **`Esc`** | Quitte le plein écran. |
+| **`Ctrl+1`** / **`Ctrl+2`** | Déplace les visionneuses sur l'écran 1 ou 2. |
 | **`Clic-Droit`** | Ouvre le menu contextuel. |
 
 ### Diaporama

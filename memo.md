@@ -1,49 +1,51 @@
 python -m photoselect
 & C:\Dev\PhotoSelect\.venv\Scripts\Activate.ps1
 
+Génération d'un exécutable
+(.venv) ps C:\Dev\PhotoSelect> pyinstaller PhotoSelect.spec
 
-Parfait. Version ultra-simple en 3 étapes, sans usine à gaz.
+Pour faire un test et voir le badge "Verified" apparaître, vous pouvez faire un petit commit "à vide" (sans modifier de fichier) et le pousser sur GitHub.
 
-Active la signature automatique des commits (avec ta clé SSH existante)
-Dans PowerShell, lance :
-git config --global gpg.format ssh
-git config --global user.signingkey "$env:USERPROFILE.ssh\id_ed25519.pub"
-git config --global commit.gpgsign true
+Tapez ces deux commandes dans votre terminal :
 
-Si ton fichier de clé a un autre nom, remplace id_ed25519.pub.
-
-Ajoute cette clé dans GitHub comme clé de signature
-Va dans :
-GitHub > Settings > SSH and GPG keys > New SSH key
-Type : Signing Key
-Colle le contenu de ton fichier .pub.
-
-Vérifie que ça marche
-Fais un commit normal puis :
+powershell
+git commit --allow-empty -m "Test de signature"
+git push
+Ce qui va se passer :
+git commit : Votre ordinateur va utiliser votre clé SSH pour signer le message.
+git push : Le message est envoyé à GitHub.
+Vérification : Allez rafraîchir la page de votre dépôt sur GitHub. Vous devriez voir apparaître le commit "Test de signature" avec le fameux bouton vert Verified à côté !
 
 git log --show-signature -1
 
-Sur GitHub, ton commit apparaîtra avec le badge Verified.
+git push -f origin main
 
-Option minimale recommandée :
-Commence juste par signer les commits. C’est déjà une preuve d’origine forte et très simple.
-Si tu veux, je te donne ensuite la version ultra-simple pour signer aussi les releases.
+Signer le commit localement :
+git commit --amend --no-edit -S
 
+Mettre à jour GitHub :
+git push -f origin main
 
------------------------------------------------
-Je m’en charge directement: je vais détecter ta clé SSH publique, configurer Git pour signer automatiquement les commits avec cette clé, puis vérifier la configuration.
+Si tu veux voir la signature dans ton terminal, tu peux exécuter ces deux commandes :
+Créer le fichier des signataires autorisés :
+echo "mchvalidation@gmail.com $(cat C:\Users\mchur\.ssh\id_ed25519.pub)" > C:\Users\mchur\.ssh\allowed_signers
 
-C’est configuré et actif.
+Dire à Git d'utiliser ce fichier :
+git config --global gpg.ssh.allowedSignersFile "C:/Users/mchur/.ssh/allowed_signers"
 
-Configuration appliquée:
+git log --show-signature -1
 
-gpg.format = ssh
-user.signingkey = C:\Users\mchur\.ssh\id_ed25519.pub
-commit.gpgsign = true
-Prochaine étape côté GitHub:
+Pour faire un commit signé (ce que tu appelles "crypté") avec tes modifications sur le contrôle d'écran, voici les commandes à taper dans ton terminal PowerShell :
 
-Ouvre Settings > SSH and GPG keys > New SSH key
-Type: Signing Key
-Colle le contenu de id_ed25519.pub
-Ensuite, ton prochain commit devrait apparaître Verified sur GitHub.
+powershell
+# 1. Ajouter tous les fichiers modifiés (app.py, README.md, etc.)
+git add .
+# 2. Créer le commit signé avec ton message
+git commit -S -m "Contrôle d'écran"
+# 3. Envoyer sur GitHub
+git push
+Pourquoi ces commandes ?
 
+-S : C'est cette option qui dit à Git d'utiliser ta clé SSH pour signer le commit.
+-m "..." : C'est le message qui apparaîtra dans ton historique.
+Une fois que c'est fait, tu verras le badge Verified sur GitHub pour ce nouveau commit !
