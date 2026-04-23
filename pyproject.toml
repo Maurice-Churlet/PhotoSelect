@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "PhotoSelect"
+version = "0.1.0"
+description = "Visionneuse photo plein écran avec gestion EXIF, copie et renommage de fichiers JPG."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "PhotoSelect Team"},
+]
+
+dependencies = [
+    "Pillow>=10.0",
+    "piexif>=1.1.3",
+    "reverse_geocoder>=1.5.1",
+    "send2trash>=1.8",
+    "mediapipe>=0.10.14",
+    "opencv-python>=4.10.0",
+]
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.0",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+photoselect = "photoselect.app:main"
+
+[project.gui-scripts]
+photoselect-gui = "photoselect.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.pyinstaller]
+# Repère pour la commande de build
+# pyinstaller --onefile --windowed --name PhotoSelect src/photoselect/__main__.py

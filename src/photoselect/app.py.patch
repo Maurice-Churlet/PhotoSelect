@@ -1,0 +1,95 @@
+# Patch pour ajouter la fonctionnalité de basculement entre UI principale et visionneuses avec la touche P/p
+
+## Modifications à apporter :
+
+### 1. Ajouter la méthode `_toggle_window_groups_focus` dans la classe `ControlPanel`
+
+```python
+    def _toggle_window_groups_focus(self, event=None) -> None:
+        """Bascule le focus entre l'UI principale et les visionneuses (raccourci P/p).
+        
+        Sur un écran unique, permet d'amener alternativement:
+        - soit l'UI principale (tableau de contrôle) au premier plan
+        - soit les visionneuses (photo + mosaïque) au premier plan
+        
+        Conserve l'ordre relatif entre viewer_photo et viewer_grid.
+        """
+        # Message temporaire dans la barre de statut
+        self._set_sticky_counter_message("", ttl=2.5)
+        
+        # Déterminer quel groupe est actuellement au premier plan
+        # Approche simple: vérifier si la fenêtre principale est au-dessus des visionneuses
+        # En pratique, on alterne simplement entre deux états
+        
+        # État 1: UI principale au premier plan
+        # État 2: Visionneuses au premier plan (visionneuse active en premier)
+        
+        # Pour simplifier, on alterne sans vérification complexe
+        # Si on appelle cette méthode, on bascule vers l'autre groupe
+        
+        # Amener les visionneuses au premier plan
+        if self.viewer_photo.winfo_viewable():
+            self.viewer_photo.lift()
+        if self.viewer_grid.winfo_viewable():
+            self.viewer_grid.lift()
+        
+        # Amener la visionneuse active au tout premier plan
+        if self.viewer.winfo_viewable():
+            self.viewer.lift()
+        
+        # Message de feedback
+        self.var_counter.set("Visionneuses au premier plan (P pour basculer)")
+        self._counter_sticky_until = time.time() + 2.5
+```
+
+### 2. Ajouter les raccourcis clavier P/p dans `ControlPanel.__init__`
+
+Après les lignes existantes pour les raccourcis V/v et F/f (lignes 1790-1793), ajouter :
+
+```python
+        # Raccourci P/p pour basculer entre UI principale et visionneuses
+        self.bind_all("<Key-p>", self._toggle_window_groups_focus)
+        self.bind_all("<Key-P>", self._toggle_window_groups_focus)
+```
+
+### 3. Mettre à jour la méthode pour gérer correctement les deux états
+
+Version améliorée de la méthode :
+
+```python
+    def _toggle_window_groups_focus(self, event=None) -> None:
+        """Bascule le focus entre l'UI principale et les visionneuses (raccourci P/p)."""
+        # Déterminer quel groupe est probablement au premier plan
+        # On utilise une variable d'état simple
+        if not hasattr(self, "_last_focused_group"):
+            self._last_focused_group = "ui"  # Par défaut, UI au démarrage
+        
+        if self._last_focused_group == "ui":
+            # Basculer vers les visionneuses
+            if self.viewer_photo.winfo_viewable():
+                self.viewer_photo.lift()
+            if self.viewer_grid.winfo_viewable():
+                self.viewer_grid.lift()
+            if self.viewer.winfo_viewable():
+                self.viewer.lift()
+            self._last_focused_group = "viewers"
+            message = "Visionneuses au premier plan (P pour basculer)"
+        else:
+            # Basculer vers l'UI principale
+            self.lift()
+            self.focus_force()
+            self._last_focused_group = "ui"
+            message = "UI principale au premier plan (P pour basculer)"
+        
+        # Message de feedback
+        self.var_counter.set(message)
+        self._counter_sticky_until = time.time() + 2.5
+        return "break"
+```
+
+### 4. Points d'attention
+
+1. La méthode doit retourner `"break"` pour empêcher la propagation de l'événement
+2. Utiliser `winfo_viewable()` pour vérifier si une fenêtre est visible (pas retirée/minimisée)
+3. `lift()` amène une fenêtre au premier plan par rapport à toutes les autres fenêtres de l'application
+4. `focus_force()` sur l'UI principale pour que le focus clavier reste sur le tableau (comme demandé)
