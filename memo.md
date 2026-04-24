@@ -1,51 +1,66 @@
-python -m photoselect
+Mémo Technique : PhotoSelect & Workflow Git
+1. Gestion du Projet (Python)
+Commandes pour l'exécution et la compilation de l'application.
+
+Environnement et Exécution
+Activer l'environnement virtuel :
+
+PowerShell
 & C:\Dev\PhotoSelect\.venv\Scripts\Activate.ps1
+Lancer l'application (mode module) :
 
-Génération d'un exécutable
-(.venv) ps C:\Dev\PhotoSelect> pyinstaller PhotoSelect.spec
+PowerShell
+python -m photoselect
+Compilation
+Générer l'exécutable Windows :
 
-Pour faire un test et voir le badge "Verified" apparaître, vous pouvez faire un petit commit "à vide" (sans modifier de fichier) et le pousser sur GitHub.
+PowerShell
+pyinstaller PhotoSelect.spec
+2. Configuration de la Signature SSH
+À configurer une seule fois pour permettre la validation locale des signatures.
 
-Tapez ces deux commandes dans votre terminal :
-
-powershell
-git commit --allow-empty -m "Test de signature"
-git push
-Ce qui va se passer :
-git commit : Votre ordinateur va utiliser votre clé SSH pour signer le message.
-git push : Le message est envoyé à GitHub.
-Vérification : Allez rafraîchir la page de votre dépôt sur GitHub. Vous devriez voir apparaître le commit "Test de signature" avec le fameux bouton vert Verified à côté !
-
-git log --show-signature -1
-
-git push -f origin main
-
-Signer le commit localement :
-git commit --amend --no-edit -S
-
-Mettre à jour GitHub :
-git push -f origin main
-
-Si tu veux voir la signature dans ton terminal, tu peux exécuter ces deux commandes :
 Créer le fichier des signataires autorisés :
+
+PowerShell
 echo "mchvalidation@gmail.com $(cat C:\Users\mchur\.ssh\id_ed25519.pub)" > C:\Users\mchur\.ssh\allowed_signers
+Déclarer le fichier à Git :
 
-Dire à Git d'utiliser ce fichier :
-git config --global gpg.ssh.allowedSignersFile "C:/Users/mchur/.ssh/allowed_signers"
+PowerShell
+git config --global gpg.ssh.allowedSignersFile "C:/Users/mch1ur/.ssh/allowed_signers"
+3. Workflow de Signature Git
+Procédure pour obtenir le badge "Verified" sur GitHub.
 
-git log --show-signature -1
-
-Pour faire un commit signé (ce que tu appelles "crypté") avec tes modifications sur le contrôle d'écran, voici les commandes à taper dans ton terminal PowerShell :
-
-powershell
-# 1. Ajouter tous les fichiers modifiés (app.py, README.md, etc.)
+Créer un commit signé
+PowerShell
+# 1. Ajouter les modifications
 git add .
-# 2. Créer le commit signé avec ton message
-git commit -S -m "Contrôle d'écran"
-# 3. Envoyer sur GitHub
-git push
-Pourquoi ces commandes ?
 
--S : C'est cette option qui dit à Git d'utiliser ta clé SSH pour signer le commit.
--m "..." : C'est le message qui apparaîtra dans ton historique.
-Une fois que c'est fait, tu verras le badge Verified sur GitHub pour ce nouveau commit !
+# 2. Créer le commit signé (-S)
+git commit -S -m "Description de la modification"
+
+# 3. Envoyer vers le dépôt
+git push
+Cas particuliers
+Premier push (lier la branche) : git push -u origin main
+
+Test rapide (commit vide) : git commit --allow-empty -m "Test de signature"
+
+Signer un commit déjà fait (amend) : git commit --amend --no-edit -S
+
+Forcer la mise à jour distante : git push -f origin main
+
+4. Vérification et Debug
+Outils pour contrôler l'état des signatures.
+
+Vérifier la signature du dernier commit dans le terminal :
+
+PowerShell
+git log --show-signature -1
+Glossaire Technique
+-S : Option de signature. Indique à Git d'utiliser votre clé SSH/GPG pour signer numériquement le commit.
+
+pyinstaller : Outil transformant un script Python en un fichier .exe autonome.
+
+--amend : Permet de modifier le tout dernier commit (pratique pour ajouter une signature oubliée).
+
+allowed_signers : Fichier qui fait le lien entre une adresse email et une clé publique pour valider l'identité de l'auteur.

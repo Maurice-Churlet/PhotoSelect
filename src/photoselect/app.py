@@ -140,6 +140,43 @@ THEME_ALBUMS: dict[str, dict[str, Any]] = {
 }
 
 
+# Configuration de l'aide contextuelle pour maintenance facile
+HELP_SHORTCUTS = {
+    "Tableau de Bord": [
+        ("Flèches", "Naviguer dans les photos"),
+        ("Espace", "Exporter la photo (copie)"),
+        ("Delete / Suppr", "Supprimer / Retirer de l'album"),
+        ("D / d", "Lancer le diaporama"),
+        ("F2", "Renommer / Éditer la photo"),
+        ("Clic Droit", "Menu contextuel"),
+        ("Ctrl+Clic", "Multi-sélection"),
+    ],
+    "Visionneuse": [
+        ("Flèches / Molette", "Photo précédente / suivante"),
+        ("Ctrl + 1 / 2", "Déplacer vers écran 1 / 2"),
+        ("Ctrl + R / L", "Rotation Droite / Gauche"),
+        ("Ctrl + U", "Normaliser orientation EXIF"),
+        ("F12 / Double-Clic", "Bascule Plein Écran"),
+        ("Esc / Echap", "Arrêter Diaporama / Quitter Plein Écran"),
+        ("Espace", "Exporter la photo"),
+        ("1 à 9", "Vitesse Diaporama (sec/photo)"),
+        ("+ / -", "Ajuster vitesse Diaporama"),
+    ],
+    "Mosaïque": [
+        ("Clic", "Ouvrir la photo d'origine"),
+        ("Ctrl + Clic", "Marquer comme Correct"),
+        ("V", "Valider (Marquer Correct)"),
+        ("F", "Faux (Marquer Inconnu)"),
+        ("Molette", "Défiler les visages"),
+    ],
+    "Global": [
+        ("F1", "Afficher cette aide contextuelle"),
+        ("Logo / Double-Clic Carte", "Réinitialiser les filtres"),
+        ("F12 (sur tableau)", "Mode Plein Écran du tableau (si supporté)"),
+    ]
+}
+
+
 def _copy_image_to_clipboard(filepath: Path) -> bool:
     """Copie une image dans le presse-papier Windows via l'API native."""
     clipboard_opened = False
@@ -378,8 +415,8 @@ class FullscreenViewer(tk.Toplevel):
         
         # Événements système
         self.bind("<Escape>", self._on_escape_key)
-        self.bind("<F11>", lambda _e: self._toggle_fullscreen())
         self.bind("<F12>", lambda _e: self._toggle_fullscreen())
+        self.bind("<F1>", lambda _e: self.parent_app._show_help())
         self.bind("<Double-1>", lambda _e: self._toggle_fullscreen())
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
         
@@ -1711,6 +1748,16 @@ class ControlPanel(tk.Tk):
         super().__init__()
         self.title(APP_TITLE + " - Panneau de Contrôle")
         
+        # Configuration de l'icône de l'application
+        try:
+            icon_path = get_resource_path("src/photoselect/assets/mch_logo.png")
+            if icon_path.exists():
+                # On utilise iconphoto qui supporte bien les PNG sur Windows et Linux
+                icon_img = ImageTk.PhotoImage(Image.open(icon_path))
+                self.iconphoto(True, icon_img)
+        except Exception as e:
+            logger.debug("Impossible de charger l'icône : %s", e)
+        
         self._load_config()
         self._saved_source_paths: list[str] = []
         self._saved_album_output_paths: list[str] = []
@@ -1841,6 +1888,10 @@ class ControlPanel(tk.Tk):
         self._last_notebook_tab_id: str | None = None
         self._notebook_tab_change_guard = False
         
+        # Initialisation du scaling dynamique (Homothétie)
+        self._scaling_base_width = 1600  # Largeur de référence pour le design
+        self._scaling_original_value = self.tk.call('tk', 'scaling')
+        self._last_scaled_width = 0
         # Initialisation variables d'état UI
         self.var_face_recognition_enabled = tk.BooleanVar(value=bool(self.config_data.get("face_recognition_enabled", False)))
         self.var_auto_sync_enabled = tk.BooleanVar(value=bool(self.config_data.get("auto_sync_enabled", True)))
@@ -1855,9 +1906,12 @@ class ControlPanel(tk.Tk):
         geom = self.config_data.get("geometry_main", "1150x750")
         self.geometry(geom)
         
-        state = self.config_data.get("state_main", "normal")
-        if state in ("zoomed", "normal"):
-            self.state(state)
+        # On force l'état agrandi (zoomed) pour répondre à la demande de plein écran avec contrôles.
+        # On utilise zoomed plutôt que normal pour occuper tout l'écran.
+        try:
+            self.state("zoomed")
+        except Exception:
+            self.state("normal")
         
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
         
@@ -1865,6 +1919,9 @@ class ControlPanel(tk.Tk):
         self._build_ui()
         self._init_photo_orientation_menu()
         self._set_ui_initializing_state(True)
+        
+        # Activer le suivi du redimensionnement pour l'homothétie
+        self.bind("<Configure>", self._handle_homothety_resize)
         
         # Auto-chargement depuis le config
         initial_in = self.var_in.get()
@@ -1885,6 +1942,9 @@ class ControlPanel(tk.Tk):
         # Démarrage Watcher
         if self.var_auto_sync_enabled.get():
             self.after(3000, self._start_watcher)
+
+        # Force le mode agrandi une seconde fois après un court délai pour garantir le plein écran
+        self.after(200, lambda: self.state("zoomed"))
             
         # Raccourcis clavier (Task 1, 2, 4)
         self.bind_all("<Key-v>", lambda e: self._on_shortcut_mark_face(1))
@@ -1894,6 +1954,7 @@ class ControlPanel(tk.Tk):
         self.bind_all("<Key-d>", self._on_global_start_slideshow_shortcut, add="+")
         self.bind_all("<Key-D>", self._on_global_start_slideshow_shortcut, add="+")
         # Raccourci P/p pour basculer entre UI principale et visionneuses
+        self.bind_all("<Key-p>", self._toggle_window_groups_focus)
         self.bind_all("<Key-P>", self._toggle_window_groups_focus)
         
         # Raccourcis changement d'écran pour les visionneuses (Ctrl+1, Ctrl+2, ...)
@@ -3798,25 +3859,31 @@ class ControlPanel(tk.Tk):
             selectcolor="#ffffff",
         ).pack(anchor="w", padx=10, pady=(0, 8))
 
-        steps = [
-            "1) Deux fois (double-clic) sur chaque fenetre Visionneuse hors plein ecran.",
-            "2) Placez les visionneuses de preference sur le second ecran.",
-            "3) Double-cliquez a nouveau sur chaque visionneuse pour repasser en plein ecran.",
-            "4) Mettez ensuite le tableau de bord en plein ecran.",
-            "5) La configuration est memorisee et restauree au prochain lancement.",
-        ]
-        for step in steps:
-            tk.Label(
-                body,
-                text=step,
-                bg="#f2f4f8",
-                fg="#1f2937",
-                font=("Segoe UI", 10),
-                justify="left",
-                anchor="w",
-                wraplength=706,
-            ).pack(fill=tk.X, pady=3)
+        # Ajout des raccourcis multi-écrans demandés en gras
+        tk.Label(
+            body,
+            text="Touche F1 : Aide et liste complète des raccourcis\n"
+                 "Ctrl + 1 / Ctrl + 2 : Déplacer les visionneuses sur l'Écran 1 ou 2\n"
+                 "Touche P : Basculer le tableau de bord au premier/arrière plan",
+            bg="#f2f4f8",
+            fg="#0f3d5e",
+            font=("Segoe UI", 11, "bold"),
+            justify="left",
+            anchor="w",
+        ).pack(fill=tk.X, pady=(0, 12))
 
+        tk.Label(
+            body,
+            text="Commencez par sélectionner votre dossier photos",
+            bg="#f2f4f8",
+            fg="#1f2937",
+            font=("Segoe UI", 10, "italic"),
+            justify="left",
+            anchor="w",
+        ).pack(fill=tk.X, pady=(10, 0))
+
+        # Suppression des étapes 1 à 5 (non-grasses) demandée.
+        
         footer = tk.Frame(dlg, bg="#f2f4f8", padx=18, pady=4)
         footer.pack(fill=tk.X, pady=(0, 14))
 
@@ -3883,6 +3950,43 @@ class ControlPanel(tk.Tk):
         
         # Buttons spéciaux (ceux qui ne sont pas en ttk)
         self.btn_colors = {"bg": "#ecf0f1", "fg": "#2c3e50", "activebackground": accent, "activeforeground": "white", "relief": "flat", "padx": 10, "pady": 5}
+
+    def _handle_homothety_resize(self, event: tk.Event) -> None:
+        """Ajuste le facteur de scaling en fonction de la largeur de la fenêtre."""
+        if event.widget != self:
+            return
+            
+        new_width = event.width
+        # Éviter les calculs inutiles si la largeur n'a pas significativement changé
+        if abs(new_width - self._last_scaled_width) < 5:
+            return
+            
+        self._last_scaled_width = new_width
+        ratio = new_width / self._scaling_base_width
+        
+        # On limite le ratio pour éviter des tailles extrêmes
+        ratio = max(0.6, min(2.0, ratio))
+        
+        # Mise à jour du scaling global de Tk (affecte les polices en points)
+        new_scaling = self._scaling_original_value * ratio
+        self.tk.call('tk', 'scaling', new_scaling)
+        
+        # Mise à jour des éléments de style basés sur les pixels
+        self._update_styles_scaling(ratio)
+
+    def _update_styles_scaling(self, ratio: float) -> None:
+        """Met à jour les styles TTK qui ne suivent pas automatiquement le scaling global."""
+        style = ttk.Style()
+        
+        # Hauteur de ligne du Treeview (pixel-based)
+        style.configure("Treeview", rowheight=int(28 * ratio))
+        
+        # Épaisseur de la barre de progression
+        style.configure("TProgressbar", thickness=int(15 * ratio))
+        
+        # On peut aussi ajuster les polices explicitement si nécessaire, 
+        # mais 'tk scaling' gère déjà la plupart des cas.
+        # Note: Certains widgets Tk (non-ttk) peuvent nécessiter un rafraîchissement.
 
     def _save_config(self) -> None:
         try:
@@ -10478,12 +10582,74 @@ class ControlPanel(tk.Tk):
             f"Purge terminée ({removed_items} dossiers supprimés, {removed_legacy} base(s) legacy supprimée(s)).",
         )
 
-    def _show_help(self) -> None:
-        """Affiche l'aide formatée dans une fenêtre séparée."""
+    def _show_help(self, _event: tk.Event | None = None) -> None:
+        """Affiche une aide contextuelle au centre de l'écran."""
+        # Déterminer le contexte
+        context = "Tableau de Bord"
+        focused = self.focus_get()
+        
+        # Si on est dans une visionneuse
+        if isinstance(focused, FullscreenViewer) or (hasattr(self, "viewer_photo") and focused and focused.winfo_toplevel() == self.viewer_photo) or (hasattr(self, "viewer_grid") and focused and focused.winfo_toplevel() == self.viewer_grid):
+            context = "Visionneuse"
+        elif self.notebook.index("current") == 1: # Index de l'onglet visages/mosaïque
+            context = "Mosaïque"
+            
+        self._show_contextual_help_window(context)
+
+    def _show_contextual_help_window(self, context: str) -> None:
+        """Crée et centre la fenêtre d'aide contextuelle."""
         win = tk.Toplevel(self)
-        win.title("PhotoSelect — Aide (F1)")
-        win.geometry("900x700")
-        self._render_markdown_help_to_widget(win, is_tab=False)
+        win.title(f"Aide PhotoSelect — {context}")
+        win.configure(bg="#1f2937") # Gris très foncé premium
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        
+        # Style
+        main_font = ("Segoe UI", 10)
+        bold_font = ("Segoe UI", 10, "bold")
+        header_font = ("Segoe UI", 14, "bold")
+        
+        # Header
+        header_frame = tk.Frame(win, bg="#111827", padx=20, pady=15)
+        header_frame.pack(fill=tk.X)
+        tk.Label(header_frame, text=f"Raccourcis : {context}", font=header_font, fg="#60a5fa", bg="#111827").pack(side=tk.LEFT)
+        tk.Label(header_frame, text="ESC pour fermer", font=("Segoe UI", 9), fg="#9ca3af", bg="#111827").pack(side=tk.RIGHT)
+        
+        # Grille des raccourcis
+        content_frame = tk.Frame(win, bg="#1f2937", padx=30, pady=20)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+        
+        shortcuts = HELP_SHORTCUTS.get(context, []) + HELP_SHORTCUTS.get("Global", [])
+        
+        for i, (key, desc) in enumerate(shortcuts):
+            # Touche (à droite, gras)
+            tk.Label(content_frame, text=key, font=bold_font, fg="#f3f4f6", bg="#1f2937", anchor="e", width=25).grid(row=i, column=0, pady=4, padx=(0, 15))
+            # Description (à gauche)
+            tk.Label(content_frame, text=desc, font=main_font, fg="#d1d5db", bg="#1f2937", anchor="w").grid(row=i, column=1, pady=4)
+            
+        # Bouton fermer
+        btn_close = tk.Button(win, text="J'ai compris", command=win.destroy, 
+                              bg="#3b82f6", fg="white", font=bold_font, 
+                              relief=tk.FLAT, padx=20, pady=8, cursor="hand2")
+        btn_close.pack(pady=20)
+        btn_close.bind("<Enter>", lambda e: btn_close.config(bg="#2563eb"))
+        btn_close.bind("<Leave>", lambda e: btn_close.config(bg="#3b82f6"))
+        
+        win.bind("<Escape>", lambda e: win.destroy())
+        
+        # Centrage
+        win.update_idletasks()
+        w = win.winfo_width()
+        h = win.winfo_height()
+        
+        # Centrer sur l'écran global
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        x = (sw // 2) - (w // 2)
+        y = (sh // 2) - (h // 2)
+        
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        win.focus_set()
 
     def _setup_manual_tab(self) -> None:
         """Initialise ou rafraîchit l'onglet Manuel."""

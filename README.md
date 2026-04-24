@@ -82,6 +82,7 @@ Antisèche des commandes utiles, regroupées par contexte.
 | Raccourci / Action | Effet |
 | --- | --- |
 | **`F1`** | Ouvre l'aide intégrée. |
+| **`P`** / **`p`** | Bascule le tableau de bord au premier / arrière plan. |
 | **La `Croix` X** | Quitte l'application en sauvegardant la géométrie. |
 
 ### Tableau
@@ -113,7 +114,7 @@ Antisèche des commandes utiles, regroupées par contexte.
 | **`Ctrl+R`** | Rotation 90° à droite. |
 | **`Ctrl+L`** | Rotation 90° à gauche. |
 | **`Ctrl+U`** | Normalise l'orientation EXIF. |
-| **`F11`** / **`F12`** | Bascule plein écran / fenêtré. |
+| **`F12`** | Bascule plein écran / fenêtré. |
 | **`Double-Clic`** | Bascule plein écran / fenêtré. |
 | **`Esc`** | Quitte le plein écran. |
 | **`Ctrl+1`** / **`Ctrl+2`** | Déplace les visionneuses sur l'écran 1 ou 2. |

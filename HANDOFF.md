@@ -954,3 +954,63 @@ Audit complet de la synchronisation entre la mosaique (onglet Visages), les side
 - Harness Python ciblé:
   - un JPG corrompu est bien détecté dans `unreadable_entries`,
   - le chemin de copie est construit sous `_PhotoSelect/Illisibles/<chemin_relatif>`.
+
+---
+
+## Mise a Jour - 23 avril 2026 (Focus, Plein écran par défaut et Onboarding)
+
+### Travaux realises
+
+1. **Plein écran ControlPanel par défaut**
+- Le tableau de bord (`ControlPanel`) s'ouvre désormais en mode agrandi (`zoomed`) par défaut au premier lancement.
+- Modification de la valeur de repli dans `__init__` (`state_main = zoomed`).
+
+2. **Raccourci de focus 'P'**
+- Ajout de la touche **`P`** (et `p`) pour basculer le premier plan entre le tableau de bord et les visionneuses.
+- Implémentation via `_toggle_window_groups_focus`.
+- Mise à jour du `README.md` et de la fenêtre d'onboarding.
+
+3. **Mise à jour Onboarding (Startup Info)**
+- Épuration complète du dialogue de démarrage :
+  - Suppression des étapes textuelles 1 à 5.
+  - Conservation uniquement des raccourcis critiques en gras (F1, Ctrl+1/2, P).
+  - Ajout d'une consigne initiale : *"Commencez par sélectionner votre dossier photos"*.
+
+4. **Ouverture Maximisée (Plein écran)**
+- L'état `zoomed` est désormais forcé au démarrage, indépendamment de la configuration précédente.
+- Ajout d'un déclencheur différé (`after(200)`) pour garantir la prise en compte du mode agrandi par Windows.
+
+### Fichiers impactes
+- `src/photoselect/app.py`
+- `README.md`
+- `HANDOFF.md`
+
+### Validation
+- Compilation Python validee sur `src/photoselect/app.py`.
+
+---
+
+## Mise a Jour - 24 avril 2026 (Scaling dynamique / Homothétie)
+
+### Travaux realises
+
+1. **Scaling automatique basé sur la largeur**
+- Implémentation d'un mécanisme de redimensionnement homothétique.
+- L'application calcule un ratio entre la largeur actuelle et une largeur de référence (1600px).
+- Ce ratio est appliqué dynamiquement au `tk scaling` global, ce qui ajuste proportionnellement la taille des polices et des éléments basés sur les points.
+
+2. **Synchronisation des styles TTK**
+- Ajout de `_update_styles_scaling` pour mettre à jour les propriétés basées sur les pixels qui ne suivent pas le `tk scaling` automatique.
+- Ajustement dynamique de :
+  - `Treeview.rowheight` (hauteur des lignes du tableau).
+  - `TProgressbar.thickness` (épaisseur de la barre de progression).
+
+3. **Optimisation**
+- Utilisation d'un seuil de tolérance (5px) dans le callback `<Configure>` pour éviter des recalculs excessifs lors de micro-mouvements.
+- Limitation du ratio entre 0.6x et 2.0x pour garantir la lisibilité.
+
+### Fichiers impactes
+- `src/photoselect/app.py`
+
+### Validation
+- Compilation Python validee sur `src/photoselect/app.py`.
