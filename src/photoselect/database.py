@@ -284,6 +284,48 @@ class Database:
         except sqlite3.Error as e:
             logger.error("Erreur création table tags thématiques : %s", e)
 
+        # Table des exclusions manuelles d'albums virtuels (auto-gérés par IA/thème)
+        try:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS virtual_album_excluded_photos (
+                        album_id INTEGER NOT NULL,
+                        photo_id INTEGER NOT NULL,
+                        excluded_at INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(album_id, photo_id),
+                        FOREIGN KEY(album_id) REFERENCES virtual_albums(id) ON DELETE CASCADE,
+                        FOREIGN KEY(photo_id) REFERENCES photos(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_valbum_excluded_album ON virtual_album_excluded_photos(album_id, photo_id)"
+                )
+        except sqlite3.Error as e:
+            logger.error("Erreur création table exclusions albums virtuels : %s", e)
+
+        # Table des exclusions manuelles de reconnaissance faciale (évite la re-attribution après reset)
+        try:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS face_excluded_assignments (
+                        photo_id INTEGER NOT NULL,
+                        person_id INTEGER NOT NULL,
+                        excluded_at INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(photo_id, person_id),
+                        FOREIGN KEY(photo_id) REFERENCES photos(id) ON DELETE CASCADE,
+                        FOREIGN KEY(person_id) REFERENCES face_persons(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_face_excluded_photo ON face_excluded_assignments(photo_id, person_id)"
+                )
+        except sqlite3.Error as e:
+            logger.error("Erreur création table exclusions visages : %s", e)
+
     @staticmethod
     def _duplicate_signature(filesize: int | None, filename: str | None, date_taken: str | None) -> str:
         """Construit une signature métier de doublon: taille + titre + date."""
@@ -852,11 +894,26 @@ class Database:
         removed_person = False
         try:
             with self._conn:
+                # Récupérer le photo_id avant suppression pour enregistrer l'exclusion
+                row_photo = self._conn.execute(
+                    "SELECT photo_id FROM photo_faces WHERE person_id = ? AND thumb_relpath = ?",
+                    (int(person_id), rel),
+                ).fetchone()
+                affected_photo_id = int(row_photo[0]) if row_photo else 0
+
                 cur = self._conn.execute(
                     "DELETE FROM photo_faces WHERE person_id = ? AND thumb_relpath = ?",
                     (int(person_id), rel),
                 )
                 removed_faces = int(cur.rowcount or 0)
+
+                if removed_faces > 0 and affected_photo_id > 0:
+                    # Mémoriser que cette photo ne doit plus être auto-attribuée à cette personne
+                    now_ts = int(time.time())
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO face_excluded_assignments(photo_id, person_id, excluded_at) VALUES (?, ?, ?)",
+                        (affected_photo_id, int(person_id), now_ts),
+                    )
 
                 remaining = self._conn.execute(
                     "SELECT COUNT(*) FROM photo_faces WHERE person_id = ?",
@@ -1008,6 +1065,24 @@ class Database:
                 moved = int(cur.rowcount or 0)
                 if moved <= 0:
                     raise sqlite3.IntegrityError("visage introuvable")
+
+                # Récupérer le photo_id pour enregistrer l'exclusion de la source
+                row_pid = self._conn.execute(
+                    "SELECT photo_id FROM photo_faces WHERE person_id = ? AND thumb_relpath = ?",
+                    (target_person_id, dst_rel),
+                ).fetchone()
+                if row_pid:
+                    affected_photo_id = int(row_pid[0])
+                    # Cette photo ne doit plus être auto-attribuée à l'ancienne personne
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO face_excluded_assignments(photo_id, person_id, excluded_at) VALUES (?, ?, ?)",
+                        (affected_photo_id, int(source_person_id), now_ts),
+                    )
+                    # S'assurer que la nouvelle attribution n'est pas bloquée par une ancienne exclusion
+                    self._conn.execute(
+                        "DELETE FROM face_excluded_assignments WHERE photo_id = ? AND person_id = ?",
+                        (affected_photo_id, target_person_id),
+                    )
 
                 source_removed = False
                 remaining = self._conn.execute(
@@ -1653,7 +1728,11 @@ class Database:
             return 0, len(unique_photo_ids)
 
     def remove_photo_from_virtual_album(self, album_id: int, photo_id: int) -> bool:
-        """Retire une photo d'un album virtuel sans supprimer le fichier."""
+        """Retire une photo d'un album virtuel sans supprimer le fichier.
+
+        Enregistre également une exclusion manuelle afin que les scans IA
+        automatiques ne puissent pas réintégrer la photo.
+        """
         aid = int(album_id or 0)
         pid = int(photo_id or 0)
         if aid <= 0 or pid <= 0:
@@ -1670,18 +1749,56 @@ class Database:
                         "UPDATE virtual_albums SET updated_at = ? WHERE id = ?",
                         (now_ts, aid),
                     )
+                    # Mémoriser l'exclusion manuelle pour les futurs scans automatiques
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO virtual_album_excluded_photos(album_id, photo_id, excluded_at) VALUES (?, ?, ?)",
+                        (aid, pid, now_ts),
+                    )
                     return True
             return False
         except sqlite3.Error as e:
             logger.error("Erreur retrait photo %s album virtuel %s : %s", pid, aid, e)
             return False
 
-    def add_photo_to_virtual_album(self, album_id: int, photo_id: int) -> bool:
-        """Ajoute une photo à un album virtuel si elle n'y est pas déjà."""
+    def add_photo_to_virtual_album(self, album_id: int, photo_id: int, ignore_exclusion: bool = False) -> bool:
+        """Ajoute une photo à un album virtuel si elle n'y est pas déjà.
+
+        Par défaut, respecte les exclusions manuelles (ne réajoute pas une photo
+        que l'utilisateur a retirée manuellement). Passer ``ignore_exclusion=True``
+        pour forcer l'ajout (usage interne ou ré-intégration explicite).
+        """
         aid = int(album_id or 0)
         pid = int(photo_id or 0)
         if aid <= 0 or pid <= 0:
             return False
+        if not ignore_exclusion:
+            try:
+                row = self._conn.execute(
+                    "SELECT 1 FROM virtual_album_excluded_photos WHERE album_id = ? AND photo_id = ?",
+                    (aid, pid),
+                ).fetchone()
+                if row is not None:
+                    return False  # Photo exclue manuellement — on ne la ré-ajoute pas
+            except sqlite3.Error:
+                pass
+        # Vérifier qu'aucun autre photo avec le même nom de fichier n'est déjà dans l'album
+        try:
+            fn_row = self._conn.execute("SELECT filename FROM photos WHERE id = ?", (pid,)).fetchone()
+            if fn_row:
+                fname = str(fn_row[0] or "")
+                if fname:
+                    dup_row = self._conn.execute(
+                        """
+                        SELECT 1 FROM virtual_album_members vam
+                        JOIN photos p ON p.id = vam.photo_id
+                        WHERE vam.album_id = ? AND p.filename = ?
+                        """,
+                        (aid, fname),
+                    ).fetchone()
+                    if dup_row is not None:
+                        return False  # Doublon par nom de fichier
+        except sqlite3.Error:
+            pass
         try:
             now_ts = int(time.time())
             with self._conn:
@@ -1700,14 +1817,48 @@ class Database:
         if aid <= 0:
             return 0
 
+        # Récupérer les exclusions manuelles pour filtrer les photo_ids
+        excluded: set[int] = set()
+        try:
+            rows = self._conn.execute(
+                "SELECT photo_id FROM virtual_album_excluded_photos WHERE album_id = ?",
+                (aid,),
+            ).fetchall()
+            excluded = {int(r[0]) for r in rows}
+        except sqlite3.Error:
+            pass
+
+        # Dédoublonnage par photo_id et par exclusion
         unique_photo_ids: list[int] = []
         seen: set[int] = set()
         for raw_photo_id in photo_ids:
             pid = int(raw_photo_id or 0)
-            if pid <= 0 or pid in seen:
+            if pid <= 0 or pid in seen or pid in excluded:
                 continue
             seen.add(pid)
             unique_photo_ids.append(pid)
+
+        # Dédoublonnage par nom de fichier (même fichier indexé depuis plusieurs chemins)
+        if unique_photo_ids:
+            try:
+                placeholders = ",".join("?" * len(unique_photo_ids))
+                fn_rows = self._conn.execute(
+                    f"SELECT id, filename FROM photos WHERE id IN ({placeholders})",
+                    unique_photo_ids,
+                ).fetchall()
+                fn_map: dict[int, str] = {int(r[0]): str(r[1] or "") for r in fn_rows}
+                seen_filenames: set[str] = set()
+                deduped: list[int] = []
+                for pid in unique_photo_ids:
+                    fname = fn_map.get(pid, "")
+                    if fname and fname in seen_filenames:
+                        continue
+                    if fname:
+                        seen_filenames.add(fname)
+                    deduped.append(pid)
+                unique_photo_ids = deduped
+            except sqlite3.Error:
+                pass
 
         now_ts = int(time.time())
         to_insert = [
@@ -1734,6 +1885,140 @@ class Database:
         except sqlite3.Error as e:
             logger.error("Erreur remplacement album virtuel %s : %s", aid, e)
             return 0
+
+    # ------------------------------------------------------------------
+    # Exclusions manuelles d'albums virtuels
+    # ------------------------------------------------------------------
+
+    def add_virtual_album_exclusion(self, album_id: int, photo_id: int) -> None:
+        """Enregistre l'exclusion manuelle d'une photo d'un album virtuel auto-géré."""
+        aid = int(album_id or 0)
+        pid = int(photo_id or 0)
+        if aid <= 0 or pid <= 0:
+            return
+        now_ts = int(time.time())
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO virtual_album_excluded_photos(album_id, photo_id, excluded_at) VALUES (?, ?, ?)",
+                    (aid, pid, now_ts),
+                )
+        except sqlite3.Error as e:
+            logger.error("Erreur add_virtual_album_exclusion(%s, %s): %s", aid, pid, e)
+
+    def remove_virtual_album_exclusion(self, album_id: int, photo_id: int) -> None:
+        """Supprime l'exclusion manuelle d'une photo d'un album virtuel (l'IA peut la ré-ajouter)."""
+        aid = int(album_id or 0)
+        pid = int(photo_id or 0)
+        if aid <= 0 or pid <= 0:
+            return
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "DELETE FROM virtual_album_excluded_photos WHERE album_id = ? AND photo_id = ?",
+                    (aid, pid),
+                )
+        except sqlite3.Error as e:
+            logger.error("Erreur remove_virtual_album_exclusion(%s, %s): %s", aid, pid, e)
+
+    def get_virtual_album_exclusions(self, album_id: int) -> set[int]:
+        """Retourne l'ensemble des photo_ids manuellement exclus d'un album virtuel."""
+        aid = int(album_id or 0)
+        if aid <= 0:
+            return set()
+        try:
+            rows = self._conn.execute(
+                "SELECT photo_id FROM virtual_album_excluded_photos WHERE album_id = ?",
+                (aid,),
+            ).fetchall()
+            return {int(r[0]) for r in rows}
+        except sqlite3.Error:
+            return set()
+
+    def is_photo_excluded_from_album(self, album_id: int, photo_id: int) -> bool:
+        """Retourne True si la photo est manuellement exclue de cet album virtuel."""
+        aid = int(album_id or 0)
+        pid = int(photo_id or 0)
+        if aid <= 0 or pid <= 0:
+            return False
+        try:
+            row = self._conn.execute(
+                "SELECT 1 FROM virtual_album_excluded_photos WHERE album_id = ? AND photo_id = ?",
+                (aid, pid),
+            ).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return False
+
+    # ------------------------------------------------------------------
+    # Exclusions manuelles de reconnaissance faciale
+    # ------------------------------------------------------------------
+
+    def add_face_exclusion(self, photo_id: int, person_id: int) -> None:
+        """Enregistre que la photo ne doit plus être automatiquement attribuée à cette personne."""
+        pid = int(photo_id or 0)
+        prid = int(person_id or 0)
+        if pid <= 0 or prid <= 0:
+            return
+        now_ts = int(time.time())
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO face_excluded_assignments(photo_id, person_id, excluded_at) VALUES (?, ?, ?)",
+                    (pid, prid, now_ts),
+                )
+        except sqlite3.Error as e:
+            logger.error("Erreur add_face_exclusion(%s, %s): %s", pid, prid, e)
+
+    def remove_face_exclusion(self, photo_id: int, person_id: int) -> None:
+        """Supprime l'exclusion faciale pour cette photo/personne (autoriser à nouveau l'attribution auto)."""
+        pid = int(photo_id or 0)
+        prid = int(person_id or 0)
+        if pid <= 0 or prid <= 0:
+            return
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "DELETE FROM face_excluded_assignments WHERE photo_id = ? AND person_id = ?",
+                    (pid, prid),
+                )
+        except sqlite3.Error as e:
+            logger.error("Erreur remove_face_exclusion(%s, %s): %s", pid, prid, e)
+
+    def get_face_exclusions_for_photo(self, photo_id: int) -> set[int]:
+        """Retourne l'ensemble des person_ids manuellement exclus pour cette photo."""
+        pid = int(photo_id or 0)
+        if pid <= 0:
+            return set()
+        try:
+            rows = self._conn.execute(
+                "SELECT person_id FROM face_excluded_assignments WHERE photo_id = ?",
+                (pid,),
+            ).fetchall()
+            return {int(r[0]) for r in rows}
+        except sqlite3.Error:
+            return set()
+
+    def person_has_face_from_filename(self, person_id: int, filename: str, exclude_photo_id: int = 0) -> bool:
+        """Retourne True si cette personne a déjà un visage associé à une photo portant ce nom de fichier."""
+        prid = int(person_id or 0)
+        fname = str(filename or "").strip()
+        if prid <= 0 or not fname:
+            return False
+        try:
+            query = """
+                SELECT 1 FROM photo_faces pf
+                JOIN photos p ON p.id = pf.photo_id
+                WHERE pf.person_id = ? AND p.filename = ?
+            """
+            params: list[Any] = [prid, fname]
+            if exclude_photo_id > 0:
+                query += " AND pf.photo_id != ?"
+                params.append(exclude_photo_id)
+            row = self._conn.execute(query, params).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return False
 
     def clear_theme_tags(self, source: str = "thematic_v1") -> None:
         """Efface tous les tags thématiques d'une source donnée."""

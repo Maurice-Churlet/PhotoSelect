@@ -1781,6 +1781,10 @@ class ControlPanel(tk.Tk):
         self._audit_thread: threading.Thread | None = None
         self._geo_clipboard: dict[str, Any] | None = None
         self.var_search = tk.StringVar()
+        self.var_gps_filter = tk.StringVar()
+        self.var_gps_zone = tk.StringVar()
+        self._gps_filter_timer: str | None = None
+        self._gps_filter_inhibit = False
         self._scope_injected_search_filter = ""
         self._scope_injected_search_armed = False
         self._last_viewer_scope = str(self.config_data.get("viewer_scope", "folder"))
@@ -2923,6 +2927,7 @@ class ControlPanel(tk.Tk):
             return
 
         row = rows[index]
+        self._reset_table_and_map_filters_for_scope_click()
         if row.get("type") == "face":
             self._active_face_person_id = row["id"]
             self._active_virtual_album_id = None
@@ -4345,6 +4350,9 @@ class ControlPanel(tk.Tk):
         """Applique immédiatement la portée d'affichage (dossier/continu/album/doublons)."""
         scope = str(self.var_viewer_scope.get() or "folder")
 
+        if scope in ("album", "virtual_album", "duplicates", "faces"):
+            self._reset_table_and_map_filters_for_scope_click()
+
         prev_scope = str(getattr(self, "_last_viewer_scope", scope) or scope)
         if hasattr(self, "var_search") and scope != prev_scope:
             current_search = str(self.var_search.get() or "").strip()
@@ -4378,6 +4386,46 @@ class ControlPanel(tk.Tk):
                     self.notebook.select(0)
             except Exception: pass
         self.update_idletasks()
+
+    def _reset_table_and_map_filters_for_scope_click(self) -> None:
+        """Efface les filtres recherche/carte lors d'un clic sur une portée spécialisée."""
+        if hasattr(self, "var_search"):
+            current_search = str(self.var_search.get() or "")
+            if current_search:
+                self.var_search.set("")
+
+        self._scope_injected_search_filter = ""
+        self._scope_injected_search_armed = False
+
+        # Evite un reload différé inutile après le reload immédiat de portée.
+        if hasattr(self, "_search_timer"):
+            try:
+                self.after_cancel(self._search_timer)
+            except Exception:
+                pass
+
+        # Efface aussi les champs GPS sans déclencher de reload différé.
+        self._gps_filter_inhibit = True
+        try:
+            if self._gps_filter_timer:
+                try:
+                    self.after_cancel(self._gps_filter_timer)
+                except Exception:
+                    pass
+                self._gps_filter_timer = None
+            if hasattr(self, "var_gps_filter"):
+                self.var_gps_filter.set("")
+            if hasattr(self, "var_gps_zone"):
+                self.var_gps_zone.set("")
+        finally:
+            self._gps_filter_inhibit = False
+
+        self._map_filter_bbox = None
+        # Revenir à une vue monde pour éviter de conserver un zoom carte résiduel.
+        self._map_view_lon_min = -180.0
+        self._map_view_lon_max = 180.0
+        self._map_view_lat_min = -90.0
+        self._map_view_lat_max = 90.0
 
     def _apply_active_selection(self, refresh_sidebar: bool = False) -> None:
         """Point de synchronisation unique pour la sélection (Album ou Visage)."""
@@ -7057,6 +7105,23 @@ class ControlPanel(tk.Tk):
         self.country_quick_text.configure(state="disabled")
         self._set_country_quick_filters([])
 
+        # Filtre GPS (coordonnées + rayon)
+        lbl_gps = tk.Label(frame_selectors, text="GPS :", anchor="w", bg="#f0f2f5")
+        lbl_gps.grid(row=5, column=0, padx=(5, 2), pady=(4, 0), sticky="w")
+        self.entry_gps_filter = tk.Entry(frame_selectors, textvariable=self.var_gps_filter, width=35)
+        self.entry_gps_filter.grid(row=5, column=1, pady=(4, 0), sticky="w")
+        self.var_gps_filter.trace_add("write", lambda *_: self._on_gps_filter_changed())
+        frame_gps_zone = tk.Frame(frame_selectors, bg="#f0f2f5")
+        frame_gps_zone.grid(row=5, column=2, padx=(0, 2), pady=(4, 0), sticky="w")
+        tk.Label(frame_gps_zone, text="Zone :", bg="#f0f2f5").pack(side="left")
+        self.entry_gps_zone = tk.Entry(frame_gps_zone, textvariable=self.var_gps_zone, width=2)
+        self.entry_gps_zone.pack(side="left", padx=(2, 2))
+        self.var_gps_zone.trace_add("write", lambda *_: self._on_gps_filter_changed())
+        tk.Button(
+            frame_gps_zone, text="×", width=2, command=self._clear_gps_filter_fields,
+            **uniform_btn_style,
+        ).pack(side="left")
+
         # Boutons Action
         frame_btns_host = tk.Frame(frame_config, bg="#f0f2f5")
         frame_btns_host.grid(row=0, column=3, rowspan=3, padx=15, pady=0, sticky="nw")
@@ -7403,6 +7468,7 @@ class ControlPanel(tk.Tk):
         self._tree_ctx_menu.add_command(label="Diaporama", command=self._start_slideshow_from_table_selection)
         self._tree_ctx_menu.add_separator()
         self._tree_ctx_menu.add_command(label="Copier la photo", command=self._copy_selected_photo)
+        self._tree_ctx_menu.add_command(label="Déplacer vers un dossier...", command=self._move_selected_to_directory)
         self._tree_ctx_menu.add_command(label="Supprimer (Corbeille)", command=self.delete_current)
         self._tree_ctx_delete_index = int(self._tree_ctx_menu.index("end") or 0)
         self._tree_ctx_menu.add_command(label="Copier la ligne", command=self._copy_selected_row)
@@ -9946,9 +10012,25 @@ class ControlPanel(tk.Tk):
         )
         payload: list[dict[str, Any]] = []
         match_threshold = self._get_face_match_threshold()
+        # Récupérer les exclusions manuelles pour cette photo (attributions à ignorer)
+        excluded_person_ids = self.db.get_face_exclusions_for_photo(photo_id)
+        photo_filename = Path(filepath).name
         for idx, detection in enumerate(detections, start=1):
             embedding = [float(v) for v in detection.get("embedding") or []]
             person_id = self.db.assign_face_person(embedding, threshold=match_threshold)
+            if person_id in excluded_person_ids:
+                logger.debug(
+                    "[faces] Photo id=%s : attribution à person_id=%s ignorée (exclusion manuelle)",
+                    photo_id, person_id,
+                )
+                continue
+            # Éviter d'ajouter la même personne plusieurs fois pour le même nom de fichier
+            if photo_filename and self.db.person_has_face_from_filename(person_id, photo_filename, exclude_photo_id=photo_id):
+                logger.debug(
+                    "[faces] Photo id=%s (%s) : doublon par nom de fichier pour person_id=%s, ignoré",
+                    photo_id, photo_filename, person_id,
+                )
+                continue
             thumb_rel = self._save_face_thumbnail(person_id, int(photo_id), idx, detection.get("thumb_image"))
             payload.append(
                 {
@@ -12512,6 +12594,119 @@ class ControlPanel(tk.Tk):
             self.after_cancel(self._search_timer)
         self._search_timer = self.after(1500, self._load_data_to_treeview)
 
+    def _on_gps_filter_changed(self) -> None:
+        """Appelé quand les champs GPS ou Zone changent (debounce)."""
+        if getattr(self, "_gps_filter_inhibit", False):
+            return
+        if self._gps_filter_timer:
+            try:
+                self.after_cancel(self._gps_filter_timer)
+            except Exception:
+                pass
+            self._gps_filter_timer = None
+        gps_text = str(self.var_gps_filter.get() or "").strip()
+        if not gps_text:
+            # Champ vidé : suppression immédiate du filtre GPS
+            self._map_filter_bbox = None
+            self._reset_map_view_to_world()
+            self._load_data_to_treeview()
+        else:
+            self._gps_filter_timer = self.after(1500, self._apply_gps_filter)
+
+    def _parse_gps_filter_input(self, text: str) -> tuple[float, float] | None:
+        """Parse les coordonnées GPS depuis les formats :
+        - 'Lat-17.65946 Lon-149.417145'
+        - '-17.6594, 149.4171' ou '-17.6594 149.4171'
+        Retourne (lat, lon) ou None si non reconnu / hors bornes.
+        """
+        import re
+        text = text.strip()
+        if not text:
+            return None
+        # Format 1 : préfixes Lat / Lon
+        m = re.fullmatch(
+            r"[Ll]at\s*(-?\d+\.?\d*)\s+[Ll]on\s*(-?\d+\.?\d*)",
+            text, re.IGNORECASE,
+        )
+        if m:
+            try:
+                lat, lon = float(m.group(1)), float(m.group(2))
+                if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+                    return lat, lon
+            except ValueError:
+                pass
+            return None
+        # Format 2 : degrés décimaux signés séparés par virgule ou espace
+        m = re.fullmatch(
+            r"(-?\d+\.?\d*)\s*(?:,|\s)\s*(-?\d+\.?\d*)",
+            text,
+        )
+        if m:
+            try:
+                lat, lon = float(m.group(1)), float(m.group(2))
+                if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+                    return lat, lon
+            except ValueError:
+                pass
+        return None
+
+    def _apply_gps_filter(self) -> None:
+        """Applique le filtre de proximité GPS : positionne la carte et filtre le tableau."""
+        self._gps_filter_timer = None
+        gps_text = str(self.var_gps_filter.get() or "").strip()
+        coords = self._parse_gps_filter_input(gps_text)
+        if coords is None:
+            return  # Saisie invalide : on ne modifie pas le filtre en cours
+        lat, lon = coords
+        self._update_geo_clipboard_from_coords(lat, lon)
+        # Zone : entier 1-9, défaut 1
+        try:
+            zone = max(1, min(9, int(str(self.var_gps_zone.get() or "").strip())))
+        except (ValueError, TypeError):
+            zone = 1
+        lon_min = max(-180.0, lon - zone)
+        lon_max = min(180.0, lon + zone)
+        lat_min = max(-90.0, lat - zone)
+        lat_max = min(90.0, lat + zone)
+        self._map_filter_bbox = (lon_min, lon_max, lat_min, lat_max)
+        w = max(1.0, float(self.map_canvas.winfo_width()))
+        h = max(1.0, float(self.map_canvas.winfo_height()))
+        self._fit_map_view_to_bbox(lon_min, lon_max, lat_min, lat_max, w, h)
+        self._load_data_to_treeview()
+
+    def _update_geo_clipboard_from_coords(self, lat: float, lon: float) -> None:
+        """Met à jour le presse-papier géolocalisation (interne + système) à partir de coordonnées."""
+        coords_str = f"{lat:.5f}, {lon:.5f}"
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(coords_str)
+        except Exception:
+            pass
+
+        resolved = get_location_details_online(lat, lon)
+        if not any(str(resolved.get(k) or "").strip() for k in ("country", "region", "city")):
+            resolved = get_location_details(lat, lon)
+
+        self._geo_clipboard = {
+            "latitude": round(lat, 6),
+            "longitude": round(lon, 6),
+            "country": str(resolved.get("country") or "").strip(),
+            "region": str(resolved.get("region") or "").strip(),
+            "city": str(resolved.get("city") or "").strip(),
+        }
+
+    def _clear_gps_filter_fields(self) -> None:
+        """Vide les champs GPS et Zone, et retire le filtre GPS actif."""
+        if self._gps_filter_timer:
+            try:
+                self.after_cancel(self._gps_filter_timer)
+            except Exception:
+                pass
+            self._gps_filter_timer = None
+        self.var_gps_filter.set("")
+        self.var_gps_zone.set("")
+        # La trace sur var_gps_filter déclenche _on_gps_filter_changed qui efface le filtre.
+
     def _on_country_quick_filter_click(self, country: str) -> None:
         """Injecte un filtre ciblé Pays=... dans la barre de recherche."""
         country_clean = str(country or "").strip()
@@ -12755,11 +12950,18 @@ class ControlPanel(tk.Tk):
             self.map_canvas.delete(self._map_drag_rect_id)
             self._map_drag_rect_id = None
 
-        if abs(ex - sx) < 8 or abs(ey - sy) < 8:
-            return
-
         w = max(1.0, float(self.map_canvas.winfo_width()))
         h = max(1.0, float(self.map_canvas.winfo_height()))
+
+        if abs(ex - sx) < 8 or abs(ey - sy) < 8:
+            # Clic simple : copie les coordonnées dans le champ GPS, le presse-papier
+            # et le presse-papier interne (géolocalisation) pour collage dans les EXIF.
+            lon, lat = self._map_xy_to_lonlat(ex, ey, w, h)
+            if hasattr(self, "var_gps_filter"):
+                self.var_gps_filter.set(f"{lat:.5f}, {lon:.5f}")
+            self._update_geo_clipboard_from_coords(lat, lon)
+            return
+
         x1, x2 = sorted((max(0.0, min(w, sx)), max(0.0, min(w, ex))))
         y1, y2 = sorted((max(0.0, min(h, sy)), max(0.0, min(h, ey))))
 
@@ -12777,7 +12979,15 @@ class ControlPanel(tk.Tk):
 
     def _clear_map_filter(self) -> None:
         self._map_filter_bbox = None
+        self._reset_map_view_to_world()
         self._load_data_to_treeview()
+
+    def _reset_map_view_to_world(self) -> None:
+        """Réinitialise la vue carte pour afficher le monde entier."""
+        self._map_view_lon_min = -180.0
+        self._map_view_lon_max = 180.0
+        self._map_view_lat_min = -90.0
+        self._map_view_lat_max = 90.0
 
     def _fit_map_view_to_bbox(
         self,
@@ -12842,6 +13052,20 @@ class ControlPanel(tk.Tk):
 
     def _on_map_reset_request(self, _event: tk.Event) -> str:
         """Réinitialise la sélection de zone carte (équivalent ancien bouton)."""
+        self._gps_filter_inhibit = True
+        try:
+            if self._gps_filter_timer:
+                try:
+                    self.after_cancel(self._gps_filter_timer)
+                except Exception:
+                    pass
+                self._gps_filter_timer = None
+            if hasattr(self, "var_gps_filter"):
+                self.var_gps_filter.set("")
+            if hasattr(self, "var_gps_zone"):
+                self.var_gps_zone.set("")
+        finally:
+            self._gps_filter_inhibit = False
         self._clear_map_filter()
         return "break"
 
@@ -13618,6 +13842,34 @@ class ControlPanel(tk.Tk):
 
         clip = self._geo_clipboard
         has_gps = clip.get("latitude") is not None and clip.get("longitude") is not None
+
+        # Si seules les coordonnées sont disponibles (ex: clic carte), tente de
+        # compléter pays/région/ville: en ligne d'abord, puis fallback local.
+        if has_gps:
+            missing_place = not any(
+                str(clip.get(k) or "").strip() for k in ("country", "region", "city")
+            )
+            if missing_place:
+                try:
+                    lat = float(clip.get("latitude"))
+                    lon = float(clip.get("longitude"))
+                except Exception:
+                    lat = None
+                    lon = None
+
+                if lat is not None and lon is not None:
+                    resolved = get_location_details_online(lat, lon)
+                    if not any(str(resolved.get(k) or "").strip() for k in ("country", "region", "city")):
+                        resolved = get_location_details(lat, lon)
+
+                    for key in ("country", "region", "city"):
+                        value = str(resolved.get(key) or "").strip()
+                        if value and not str(clip.get(key) or "").strip():
+                            clip[key] = value
+
+                    # Conserve l'enrichissement pour les collages suivants.
+                    self._geo_clipboard = clip
+
         has_country = bool(str(clip.get("country") or ""))
         has_region = bool(str(clip.get("region") or ""))
         has_city = bool(str(clip.get("city") or ""))
@@ -13643,10 +13895,25 @@ class ControlPanel(tk.Tk):
         var_region = tk.BooleanVar(value=has_region)
         var_city = tk.BooleanVar(value=has_city)
 
-        cb_gps = tk.Checkbutton(frame, text="GPS (Latitude + Longitude)", variable=var_gps)
-        cb_country = tk.Checkbutton(frame, text="Pays", variable=var_country)
-        cb_region = tk.Checkbutton(frame, text="Région", variable=var_region)
-        cb_city = tk.Checkbutton(frame, text="Ville", variable=var_city)
+        gps_label = "GPS"
+        if has_gps:
+            try:
+                gps_label = f"GPS: {float(clip.get('latitude')):.5f}, {float(clip.get('longitude')):.5f}"
+            except Exception:
+                gps_label = "GPS"
+
+        country_value = str(clip.get("country") or "").strip()
+        region_value = str(clip.get("region") or "").strip()
+        city_value = str(clip.get("city") or "").strip()
+
+        country_label = f"Pays: {country_value}" if country_value else "Pays"
+        region_label = f"Région: {region_value}" if region_value else "Région"
+        city_label = f"Ville: {city_value}" if city_value else "Ville"
+
+        cb_gps = tk.Checkbutton(frame, text=gps_label, variable=var_gps)
+        cb_country = tk.Checkbutton(frame, text=country_label, variable=var_country)
+        cb_region = tk.Checkbutton(frame, text=region_label, variable=var_region)
+        cb_city = tk.Checkbutton(frame, text=city_label, variable=var_city)
         cb_gps.pack(anchor="w")
         cb_country.pack(anchor="w")
         cb_region.pack(anchor="w")
@@ -14618,6 +14885,374 @@ class ControlPanel(tk.Tk):
             self._update_statistics()
         except Exception as e:
             logger.error("Erreur copie : %s", e)
+
+    @staticmethod
+    def _build_incremented_move_name(target_dir: Path, source_name: str) -> str:
+        """Construit un nom disponible en ajoutant un suffixe incrémental."""
+        source = Path(source_name)
+        stem = source.stem
+        suffix = source.suffix
+        idx = 1
+        while True:
+            candidate = f"{stem} ({idx}){suffix}"
+            if not (target_dir / candidate).exists():
+                return candidate
+            idx += 1
+
+    def _ask_move_conflict_resolution(self, source_path: Path, dest_path: Path) -> tuple[str, bool] | None:
+        """Demande la stratégie de résolution d'un conflit de déplacement.
+
+        Retourne:
+        - ("skip"|"replace"|"rename", apply_to_all)
+        - None si l'utilisateur annule l'opération complète.
+        """
+        dlg = tk.Toplevel(self)
+        dlg.title("Conflit de fichier")
+        dlg.configure(bg="#f0f2f5")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        result: dict[str, Any] = {"action": None, "apply_all": False}
+
+        try:
+            same_path = source_path.resolve() == dest_path.resolve()
+        except Exception:
+            same_path = False
+
+        title_txt = "Le fichier existe déjà à destination." if not same_path else "La destination est identique à la source."
+        tk.Label(
+            dlg,
+            text=title_txt,
+            bg="#f0f2f5",
+            fg="#1f2937",
+            font=("Segoe UI", 11, "bold"),
+            anchor="w",
+            justify="left",
+        ).pack(fill=tk.X, padx=14, pady=(12, 4))
+
+        tk.Label(
+            dlg,
+            text=f"Fichier: {source_path.name}",
+            bg="#f0f2f5",
+            fg="#374151",
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+        ).pack(fill=tk.X, padx=14, pady=(0, 8))
+
+        preview_frame = tk.Frame(dlg, bg="#f0f2f5")
+        preview_frame.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 6))
+
+        def _build_preview(parent: tk.Misc, title: str, path: Path) -> None:
+            panel = tk.Frame(parent, bg="#ffffff", bd=1, relief="solid")
+            panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6)
+
+            tk.Label(panel, text=title, bg="#ffffff", fg="#111827", font=("Segoe UI", 10, "bold")).pack(
+                anchor="w", padx=8, pady=(8, 4)
+            )
+
+            preview_holder = tk.Label(panel, bg="#ffffff", width=280, height=220)
+            preview_holder.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+            info_text = f"{path.name}\n{path.parent}"
+            try:
+                with Image.open(path) as img:
+                    img = ImageOps.exif_transpose(img)
+                    img.thumbnail((280, 220), Image.Resampling.LANCZOS)
+                    tk_img = ImageTk.PhotoImage(img.copy())
+                preview_holder.configure(image=tk_img)
+                preview_holder.image = tk_img
+                try:
+                    size_text = format_size(path.stat().st_size)
+                except Exception:
+                    size_text = "-"
+                info_text = f"{path.name}\n{size_text}\n{path.parent}"
+            except Exception:
+                preview_holder.configure(text="Aperçu indisponible", fg="#6b7280", font=("Segoe UI", 10, "italic"))
+
+            tk.Label(
+                panel,
+                text=info_text,
+                bg="#ffffff",
+                fg="#374151",
+                justify="left",
+                anchor="w",
+                wraplength=300,
+                font=("Segoe UI", 9),
+            ).pack(fill=tk.X, padx=8, pady=(4, 8))
+
+        _build_preview(preview_frame, "Photo sélectionnée", source_path)
+        _build_preview(preview_frame, "Photo déjà présente", dest_path)
+
+        apply_all_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            dlg,
+            text="Pour tout (appliquer ce choix aux prochains conflits)",
+            variable=apply_all_var,
+            bg="#f0f2f5",
+            activebackground="#f0f2f5",
+            selectcolor="#ffffff",
+            fg="#1f2937",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w", padx=14, pady=(2, 8))
+
+        btns = tk.Frame(dlg, bg="#f0f2f5")
+        btns.pack(fill=tk.X, padx=14, pady=(0, 12))
+
+        def _choose(action: str) -> None:
+            result["action"] = action
+            result["apply_all"] = bool(apply_all_var.get())
+            dlg.destroy()
+
+        tk.Button(
+            btns,
+            text="Conserver l'existante",
+            command=lambda: _choose("skip"),
+            bg="#e5e7eb",
+            fg="#111827",
+            activebackground="#d1d5db",
+            activeforeground="#111827",
+            width=20,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Button(
+            btns,
+            text="Remplacer",
+            command=lambda: _choose("replace"),
+            bg="#fde68a",
+            fg="#1f2937",
+            activebackground="#fcd34d",
+            activeforeground="#111827",
+            width=14,
+        ).pack(side=tk.LEFT, padx=6)
+
+        tk.Button(
+            btns,
+            text="Renommer la déplacée",
+            command=lambda: _choose("rename"),
+            bg="#bfdbfe",
+            fg="#1f2937",
+            activebackground="#93c5fd",
+            activeforeground="#111827",
+            width=20,
+        ).pack(side=tk.LEFT, padx=6)
+
+        tk.Button(
+            btns,
+            text="Annuler",
+            command=dlg.destroy,
+            bg="#fecaca",
+            fg="#7f1d1d",
+            activebackground="#fca5a5",
+            activeforeground="#7f1d1d",
+            width=12,
+        ).pack(side=tk.RIGHT)
+
+        try:
+            self.wait_window(dlg)
+        except Exception:
+            return None
+
+        action = result.get("action")
+        if action not in ("skip", "replace", "rename"):
+            return None
+        return (str(action), bool(result.get("apply_all")))
+
+    def _move_selected_to_directory(self) -> None:
+        """Déplace les photos sélectionnées vers un autre dossier (multi-sélection)."""
+        if self._is_album_scope_active():
+            messagebox.showinfo("Déplacer", "Indisponible en mode Sélection.")
+            return
+        if not self.db:
+            return
+
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("Déplacer", "Sélectionnez au moins une photo.")
+            return
+
+        initial_dir = self.var_in.get().strip() if hasattr(self, "var_in") else ""
+        if not initial_dir:
+            initial_dir = str(self._current_source_dir) if self._current_source_dir else str(Path.home())
+
+        target_dir_raw = filedialog.askdirectory(
+            parent=self,
+            title="Déplacer vers un répertoire",
+            initialdir=initial_dir,
+            mustexist=True,
+        )
+        if not target_dir_raw:
+            return
+
+        target_dir = Path(target_dir_raw)
+        count = len(selection)
+        if not messagebox.askyesno(
+            "Confirmation déplacement",
+            f"Déplacer {count} photo(s) vers :\n{target_dir}\n\nContinuer ?",
+        ):
+            return
+
+        try:
+            self.progress.stop()
+        except Exception:
+            pass
+        self.progress.configure(mode="determinate", maximum=max(1, count), value=0)
+        self.var_counter.set(f"Déplacement : 0/{count}")
+        self.update_idletasks()
+
+        moved = 0
+        skipped_exists = 0
+        skipped_missing = 0
+        failed = 0
+        cancelled = False
+        moved_ids: list[str] = []
+        conflict_apply_all_action: str | None = None
+
+        for idx, item_id in enumerate(selection):
+            photo_id = int(item_id)
+            row = self._get_photo_by_id(photo_id)
+            if not row:
+                skipped_missing += 1
+                self.progress.configure(value=idx + 1)
+                self.var_counter.set(f"Déplacement : {idx + 1}/{count}")
+                self.update_idletasks()
+                continue
+
+            source_path = self._abs_path(str(row.get("filepath") or ""))
+            if not source_path or not source_path.exists():
+                skipped_missing += 1
+                self.progress.configure(value=idx + 1)
+                self.var_counter.set(f"Déplacement : {idx + 1}/{count}")
+                self.update_idletasks()
+                continue
+
+            dest_path = target_dir / source_path.name
+            try:
+                same_path = source_path.resolve() == dest_path.resolve()
+            except Exception:
+                same_path = False
+            has_conflict = bool(same_path or dest_path.exists())
+            if has_conflict:
+                if conflict_apply_all_action in ("skip", "replace", "rename"):
+                    action = str(conflict_apply_all_action)
+                else:
+                    decision = self._ask_move_conflict_resolution(source_path, dest_path)
+                    if decision is None:
+                        cancelled = True
+                        break
+                    action, apply_all = decision
+                    if apply_all:
+                        conflict_apply_all_action = action
+
+                if action == "skip":
+                    skipped_exists += 1
+                    self.progress.configure(value=idx + 1)
+                    self.var_counter.set(f"Déplacement : {idx + 1}/{count}")
+                    self.update_idletasks()
+                    continue
+
+                if action == "replace":
+                    if same_path:
+                        skipped_exists += 1
+                        self.progress.configure(value=idx + 1)
+                        self.var_counter.set(f"Déplacement : {idx + 1}/{count}")
+                        self.update_idletasks()
+                        continue
+                    try:
+                        if dest_path.exists():
+                            send2trash(str(dest_path.resolve()))
+                    except Exception:
+                        try:
+                            if dest_path.exists():
+                                dest_path.unlink()
+                        except Exception as exc:
+                            failed += 1
+                            logger.error("Erreur remplacement (suppression cible) photo_id=%s: %s", photo_id, exc)
+                            self.progress.configure(value=idx + 1)
+                            self.var_counter.set(f"Déplacement : {idx + 1}/{count}")
+                            self.update_idletasks()
+                            continue
+
+                if action == "rename":
+                    dest_path = target_dir / self._build_incremented_move_name(target_dir, source_path.name)
+
+            try:
+                ensure_directory(target_dir)
+                shutil.move(str(source_path), str(dest_path))
+                new_rel = self._rel_path(dest_path)
+                self.db.update_photo_path(photo_id, new_rel, dest_path.name)
+
+                # Vérifie que la DB reflète bien le nouveau chemin; sinon rollback best-effort.
+                check_row = self.db.get_photo_by_id(photo_id)
+                if not check_row or str(check_row.get("filepath") or "") != str(new_rel):
+                    try:
+                        if dest_path.exists() and not source_path.exists():
+                            shutil.move(str(dest_path), str(source_path))
+                    except Exception:
+                        pass
+                    failed += 1
+                else:
+                    moved += 1
+                    moved_ids.append(str(photo_id))
+            except Exception as exc:
+                failed += 1
+                logger.error("Erreur déplacement photo_id=%s: %s", photo_id, exc)
+
+            self.progress.configure(value=idx + 1)
+            self.var_counter.set(f"Déplacement : {idx + 1}/{count}")
+            self.update_idletasks()
+
+        if cancelled:
+            self.var_counter.set("Déplacement interrompu par l'utilisateur.")
+
+        self._load_data_to_treeview()
+
+        # Restaure la sélection sur les lignes déplacées encore visibles.
+        if moved_ids:
+            restored = [iid for iid in moved_ids if self.tree.exists(iid)]
+            if restored:
+                self.tree.selection_set(restored)
+                self.tree.focus(restored[0])
+                self.tree.see(restored[0])
+
+        self._update_statistics()
+        self._audit_event(
+            "move_to_directory",
+            {
+                "selected": count,
+                "moved": moved,
+                "skipped_exists": skipped_exists,
+                "skipped_missing": skipped_missing,
+                "failed": failed,
+                "cancelled": cancelled,
+                "target": str(target_dir),
+            },
+        )
+
+        if cancelled:
+            self.var_counter.set(
+                f"Déplacement interrompu. Déplacées: {moved}, conflits: {skipped_exists}, introuvables: {skipped_missing}, erreurs: {failed}."
+            )
+        else:
+            self.var_counter.set(
+                f"Déplacement terminé. Déplacées: {moved}, conflits: {skipped_exists}, introuvables: {skipped_missing}, erreurs: {failed}."
+            )
+        if cancelled:
+            messagebox.showwarning(
+                "Déplacement interrompu",
+                f"Déplacées: {moved}\nConflits (conservées/ignorées): {skipped_exists}\nIntrouvables: {skipped_missing}\nErreurs: {failed}",
+            )
+        elif failed > 0:
+            messagebox.showwarning(
+                "Déplacement terminé",
+                f"Déplacées: {moved}\nConflits (déjà présent): {skipped_exists}\nIntrouvables: {skipped_missing}\nErreurs: {failed}",
+            )
+        else:
+            messagebox.showinfo(
+                "Déplacement terminé",
+                f"Déplacées: {moved}\nConflits (déjà présent): {skipped_exists}\nIntrouvables: {skipped_missing}",
+            )
 
     def delete_current(self) -> None:
         """Supprime les photos sélectionnées (Touche Suppr). Multi-sélection supportée."""

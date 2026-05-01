@@ -49,6 +49,7 @@ L'objectif principal est de rationaliser le fastidieux processus de tri des phot
 - **Tableau de Bord épuré** : Interface simplifiée sans titres redondants pour maximiser l'espace utile.
 - **Recherche instantanée** : Un champ de recherche filtre le tableau en temps réel par nom de collection (ex: tapez `Paris` ou `2407` pour retrouver vos photos).
 - **Recherche ciblée par colonne** : Le champ accepte aussi `pays=...`, `région=...`/`region=...` et `ville=...` pour filtrer uniquement la colonne demandée (ex: `pays=th`, `region=faro`, `ville=lyon`).
+- **Filtre GPS dédié** : Sous la liste des pays, un champ `GPS` accepte les formats `Lat-17.65946 Lon-149.417145` ou `-17.6594, 149.4171`, avec un champ `Zone` (1 à 9 degrés) pour filtrer le tableau et cadrer la carte autour du point.
 - **Sélecteurs de répertoires persistants** : Les champs Source et Dossier sélection sont des sélecteurs (liste triée alphabétiquement), alimentés automatiquement par `Parcourir`.
 - **Visionneuse plein écran synchronisée** qui s'aligne automatiquement avec les résultats du tableau, compatible multi-écrans avec DPI hétérogènes.
 - **Scan interruptible avec reprise** : Le scan peut être interrompu et repris là où il s'est arrêté. Des statistiques en temps réel (vitesse, temps restant) sont affichées.
@@ -92,6 +93,8 @@ Antisèche des commandes utiles, regroupées par contexte.
 | **`Clic-Gauche`** | Sélectionne la ligne et affiche l'image. |
 | **`Double-Clic`** | Renomme la photo sélectionnée. |
 | **`Clic-Droit`** | Ouvre le menu contextuel de la ligne. |
+| **Menu contextuel -> Déplacer vers un dossier...** | Déplace toutes les photos sélectionnées vers un autre répertoire. |
+| **Menu contextuel -> Coller géolocalisation (sélection)...** | Colle GPS/Pays/Région/Ville sur une ou plusieurs photos (au choix). |
 | **`Ctrl+Clic`** / **`Shift+Clic`** | Multi-sélection de photos dans le tableau. |
 | **`Clic-Gauche`** sur **Coordonnées GPS** | Ouvre Google Maps si les coordonnées existent. |
 | **`Flèches`** | Déplace la sélection. |
@@ -218,6 +221,7 @@ Une version exécutable autonome (`PhotoSelect.exe`) est disponible. Elle ne né
 
 - La carte affiche des contours de pays précis (GeoJSON local) et non plus des formes approximatives.
 - **Molette sur la carte** : zoom avant/arrière centré sur le curseur (avec limites min/max).
+- **Clic simple sur la carte** : copie les coordonnées (`lat, lon`) dans le champ GPS, dans le presse-papier Windows, et prépare ces coordonnées pour le collage géolocalisation.
 - **Sélection de zone** : filtre le tableau, puis zoome/recentre automatiquement la carte sur la zone.
 - **Réinitialisation de zone** : double-clic sur la carte ou clic sur le logo.
 - Les points GPS restent affichés après sélection de zone.
@@ -232,6 +236,7 @@ Une version exécutable autonome (`PhotoSelect.exe`) est disponible. Elle ne né
 - **Audit intégrité enrichi (GPS sans lieu)** : l'audit détecte les photos avec coordonnées GPS mais sans `Pays/Région/Ville`.
 - **Correction offline** : l'audit propose de compléter ces champs depuis la base locale (sans appel en ligne).
 - **Option EXIF dédiée** : lors du complément offline, une option séparée permet d'écrire (ou non) les métadonnées EXIF.
+- **Collage géolocalisation intelligent** : lors d'un collage GPS, PhotoSelect tente d'abord de compléter `Pays/Région/Ville` via recherche en ligne, puis en local si besoin, sans message d'erreur si les deux échouent.
 
 ## Installation & Lancement (Version développeur)
 
