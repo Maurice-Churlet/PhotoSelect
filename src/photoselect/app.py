@@ -12,6 +12,7 @@ import csv
 from collections import Counter
 from datetime import datetime
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -1821,6 +1822,7 @@ class ControlPanel(tk.Tk):
         self._active_virtual_album_id: int | None = None
         self._active_virtual_album_name = str(self.config_data.get("last_virtual_album_name") or "").strip()
         self._virtual_album_listbox_syncing = False
+        self._suppress_virtual_album_select_events = 0
         self._duplicate_photo_ids: set[int] = set()
         self._duplicate_group_count: int = 0
         self._duplicate_cache_valid: bool = False
@@ -1872,6 +1874,7 @@ class ControlPanel(tk.Tk):
         self._faces_inline_edit_open = False
         self._faces_inline_selected_target: str = ""
         self._faces_tab_needs_refresh = True
+        self._faces_refresh_last_reason = "init"
         self._faces_tab_visible = False
         self._startup_load_token = 0
         self._startup_tree_loading = False
@@ -1889,13 +1892,16 @@ class ControlPanel(tk.Tk):
         self._face_person_blocks: dict[int, tk.Frame] = {}
         self._pending_scroll_person_id: int | None = None
         self._faces_sidebar_syncing = False
+        self._suppress_faces_sidebar_select_events = 0
         self._last_notebook_tab_id: str | None = None
         self._notebook_tab_change_guard = False
         
         # Initialisation du scaling dynamique (Homothétie)
         self._scaling_base_width = 1600  # Largeur de référence pour le design
+        self._scaling_base_height = 980  # Hauteur de référence pour garantir la visibilité complète
         self._scaling_original_value = self.tk.call('tk', 'scaling')
         self._last_scaled_width = 0
+        self._last_scaled_height = 0
         # Initialisation variables d'état UI
         self.var_face_recognition_enabled = tk.BooleanVar(value=bool(self.config_data.get("face_recognition_enabled", False)))
         self.var_auto_sync_enabled = tk.BooleanVar(value=bool(self.config_data.get("auto_sync_enabled", True)))
@@ -2713,6 +2719,7 @@ class ControlPanel(tk.Tk):
             for index, row in enumerate(rows):
                 if int(row.get("id") or 0) != active_id:
                     continue
+                self._suppress_virtual_album_select_events += 1
                 listbox.selection_set(index)
                 listbox.activate(index)
                 listbox.see(index)
@@ -2745,12 +2752,14 @@ class ControlPanel(tk.Tk):
             
             if target_index != -1:
                 if not current_sel or int(current_sel[0]) != target_index:
+                    self._suppress_virtual_album_select_events += 1
                     listbox.selection_clear(0, tk.END)
                     listbox.selection_set(target_index)
                     listbox.activate(target_index)
                     listbox.see(target_index)
             else:
                 # Evite qu'une sélection fantôme persiste après rebuild.
+                self._suppress_virtual_album_select_events += 1
                 listbox.selection_clear(0, tk.END)
         finally:
             self._virtual_album_listbox_syncing = False
@@ -2777,6 +2786,7 @@ class ControlPanel(tk.Tk):
         current_sel = tree.selection()
         if target_node:
             if not current_sel or str(current_sel[0]) != target_node:
+                self._suppress_faces_sidebar_select_events += 1
                 tree.selection_remove(*current_sel)
                 tree.selection_set(target_node)
                 tree.focus(target_node)
@@ -2784,6 +2794,7 @@ class ControlPanel(tk.Tk):
             self._selected_face_target_person_name = active_name
         else:
             if current_sel:
+                self._suppress_faces_sidebar_select_events += 1
                 tree.selection_remove(*current_sel)
             if not active_name:
                 self._selected_face_target_person_name = None
@@ -2915,6 +2926,9 @@ class ControlPanel(tk.Tk):
 
     def _on_virtual_album_listbox_select(self, _event: tk.Event | None = None) -> None:
         if self._virtual_album_listbox_syncing or not hasattr(self, "list_virtual_albums"):
+            return
+        if int(getattr(self, "_suppress_virtual_album_select_events", 0)) > 0:
+            self._suppress_virtual_album_select_events = max(0, int(self._suppress_virtual_album_select_events) - 1)
             return
 
         selection = self.list_virtual_albums.curselection()
@@ -3957,38 +3971,48 @@ class ControlPanel(tk.Tk):
         self.btn_colors = {"bg": "#ecf0f1", "fg": "#2c3e50", "activebackground": accent, "activeforeground": "white", "relief": "flat", "padx": 10, "pady": 5}
 
     def _handle_homothety_resize(self, event: tk.Event) -> None:
-        """Ajuste le facteur de scaling en fonction de la largeur de la fenêtre."""
+        """Ajuste le facteur de scaling pour garder toute l'UI visible.
+
+        Le ratio est calculé sur largeur ET hauteur pour éviter qu'un écran
+        très large (mais peu haut) n'agrandisse l'UI au point de couper le bas.
+        """
         if event.widget != self:
             return
-            
+
         new_width = event.width
-        # Éviter les calculs inutiles si la largeur n'a pas significativement changé
-        if abs(new_width - self._last_scaled_width) < 5:
+        new_height = event.height
+
+        # Éviter les calculs inutiles si la taille n'a pas significativement changé
+        if abs(new_width - self._last_scaled_width) < 5 and abs(new_height - self._last_scaled_height) < 5:
             return
-            
+
         self._last_scaled_width = new_width
-        ratio = new_width / self._scaling_base_width
-        
-        # On limite le ratio pour éviter des tailles extrêmes
-        ratio = max(0.6, min(2.0, ratio))
-        
+        self._last_scaled_height = new_height
+
+        ratio_w = new_width / max(1.0, float(self._scaling_base_width))
+        ratio_h = new_height / max(1.0, float(self._scaling_base_height))
+        ratio = min(ratio_w, ratio_h)
+
+        # Limiter les tailles extrêmes tout en gardant l'UI lisible.
+        ratio = max(0.55, min(2.0, ratio))
+
         # Mise à jour du scaling global de Tk (affecte les polices en points)
         new_scaling = self._scaling_original_value * ratio
         self.tk.call('tk', 'scaling', new_scaling)
-        
+
         # Mise à jour des éléments de style basés sur les pixels
         self._update_styles_scaling(ratio)
 
     def _update_styles_scaling(self, ratio: float) -> None:
         """Met à jour les styles TTK qui ne suivent pas automatiquement le scaling global."""
         style = ttk.Style()
-        
+
         # Hauteur de ligne du Treeview (pixel-based)
-        style.configure("Treeview", rowheight=int(28 * ratio))
-        
+        style.configure("Treeview", rowheight=max(16, int(28 * ratio)))
+
         # Épaisseur de la barre de progression
-        style.configure("TProgressbar", thickness=int(15 * ratio))
-        
+        style.configure("TProgressbar", thickness=max(8, int(15 * ratio)))
+
         # On peut aussi ajuster les polices explicitement si nécessaire, 
         # mais 'tk scaling' gère déjà la plupart des cas.
         # Note: Certains widgets Tk (non-ttk) peuvent nécessiter un rafraîchissement.
@@ -8173,7 +8197,7 @@ class ControlPanel(tk.Tk):
         if self._is_notebook_tab_focused(self.tab_stats):
             self._update_face_stats_line_only()
         # L'onglet Visages ne doit pas se repeindre en tâche de fond.
-        self._faces_tab_needs_refresh = True
+        self._mark_faces_tab_dirty("background_ui_tick")
 
     def _on_notebook_tab_changed(self, _event: tk.Event | None = None) -> None:
         """Rafraîchit uniquement l'onglet sélectionné pour limiter les repaints."""
@@ -8200,7 +8224,7 @@ class ControlPanel(tk.Tk):
             return
         if self._is_notebook_tab_focused(self.tab_faces):
             if previous_tab_id != faces_tab_id:
-                self._faces_tab_needs_refresh = True
+                self._mark_faces_tab_dirty("tab_changed_to_faces")
             if self._faces_tab_needs_refresh:
                 self._refresh_faces_tab()
             elif self._active_face_person_id:
@@ -8249,7 +8273,13 @@ class ControlPanel(tk.Tk):
         else:
             p_id = person_ids[0]
 
-        logger.info("[sync] Synchronisation mosaïque vers personne %s via photo %s", p_id, photo_id)
+        logger.info(
+            "[sync] Synchronisation mosaïque vers personne %s via photo %s (active_avant=%s, candidats=%s)",
+            p_id,
+            photo_id,
+            active_id,
+            person_ids,
+        )
 
         if p_id != int(self._active_face_person_id or 0):
             self._active_face_person_id = p_id
@@ -8262,10 +8292,46 @@ class ControlPanel(tk.Tk):
         # Utiliser le système de scroll différé (<Map>) si l'onglet est masqué
         self._scroll_to_face_person_block(p_id)
 
-    def _request_faces_tab_refresh(self) -> None:
-        """Planifie et exécute un rafraîchissement immédiat de la mosaïque."""
+    def _mark_faces_tab_dirty(self, reason: str = "", caller_override: str = "") -> None:
+        """Marque l'onglet Visages comme à reconstruire et journalise l'origine."""
+        frame = inspect.currentframe()
+        caller = "unknown"
+        if frame is not None and frame.f_back is not None:
+            caller = str(frame.f_back.f_code.co_name or "unknown")
+        if caller_override:
+            caller = str(caller_override)
+
+        why = str(reason or "unspecified").strip()
+        already_dirty = bool(self._faces_tab_needs_refresh)
         self._faces_tab_needs_refresh = True
-        self._refresh_faces_tab()
+        self._faces_refresh_last_reason = f"{why} | caller={caller}"
+        logger.info(
+            "[mosaic] Mark refresh. reason=%s caller=%s already_dirty=%s active_person=%s tab_focused=%s",
+            why,
+            caller,
+            already_dirty,
+            self._active_face_person_id,
+            self._is_notebook_tab_focused(self.tab_faces) if hasattr(self, "tab_faces") else False,
+        )
+
+    def _request_faces_tab_refresh(self, reason: str = "") -> None:
+        """Demande un refresh mosaïque.
+
+        Si l'onglet Visages n'est pas actif, on ne reconstruit pas immédiatement
+        pour éviter les refresh intempestifs en arrière-plan: on marque seulement
+        l'état "dirty" et le rebuild sera fait à l'activation de l'onglet.
+        """
+        external_caller = "unknown"
+        frame = inspect.currentframe()
+        if frame is not None and frame.f_back is not None:
+            external_caller = str(frame.f_back.f_code.co_name or "unknown")
+
+        why = str(reason or "explicit_request").strip()
+        self._mark_faces_tab_dirty(why, caller_override=external_caller)
+
+        is_faces_tab_focused = self._is_notebook_tab_focused(self.tab_faces) if hasattr(self, "tab_faces") else False
+        if is_faces_tab_focused:
+            self._refresh_faces_tab()
 
     def _scroll_to_face_person_block(self, person_id: int) -> None:
         """Fait défiler la mosaïque pour afficher le groupe de la personne spécifiée."""
@@ -8509,7 +8575,8 @@ class ControlPanel(tk.Tk):
                     self._set_face_runtime_status("Activation annulée (dossier manquant)")
 
         self._set_faces_selector_visibility(enabled)
-        self._set_faces_scope_visibility(enabled)
+        # Le scope "Visages" doit rester visible même si l'autorisation faciale est décochée.
+        self._set_faces_scope_visibility(True)
 
         if self.db:
             self.db.set_face_index_enabled(enabled, self._get_face_engine_backend())
@@ -9091,8 +9158,18 @@ class ControlPanel(tk.Tk):
         if not hasattr(self, "faces_tab_grid"):
             return
 
-        logger.info("[mosaic] Refresh demandé. needs_refresh=%s, active_person=%s", 
-                    self._faces_tab_needs_refresh, self._active_face_person_id)
+        frame = inspect.currentframe()
+        refresh_caller = "unknown"
+        if frame is not None and frame.f_back is not None:
+            refresh_caller = str(frame.f_back.f_code.co_name or "unknown")
+
+        logger.info(
+            "[mosaic] Refresh demandé. needs_refresh=%s, active_person=%s, caller=%s, last_reason=%s",
+            self._faces_tab_needs_refresh,
+            self._active_face_person_id,
+            refresh_caller,
+            getattr(self, "_faces_refresh_last_reason", ""),
+        )
 
         # Si pas besoin de reconstruction et qu'on a juste besoin de scroller
         if not self._faces_tab_needs_refresh:
@@ -9352,8 +9429,7 @@ class ControlPanel(tk.Tk):
         # Sélectionner la personne renommée dans la sidebar après le refresh
         self._active_face_person_id = int(person_id)
         self._last_faces_sidebar_structure = None  # invalide le cache pour forcer la reconstruction
-        self._faces_tab_needs_refresh = True
-        self._refresh_faces_tab()
+        self._request_faces_tab_refresh(reason="rename_face_person_ui")
         self._refresh_faces_sidebar(select_active=True)
         self._load_data_to_treeview()
         if worker_was_running and (bool(self.var_face_recognition_enabled.get()) if hasattr(self, "var_face_recognition_enabled") else False):
@@ -9519,6 +9595,9 @@ class ControlPanel(tk.Tk):
     def _on_faces_sidebar_select(self, _event: tk.Event) -> None:
         # Guard : ignorer les événements pendant le rebuild de la sidebar
         if self._faces_sidebar_syncing:
+            return
+        if int(getattr(self, "_suppress_faces_sidebar_select_events", 0)) > 0:
+            self._suppress_faces_sidebar_select_events = max(0, int(self._suppress_faces_sidebar_select_events) - 1)
             return
 
         selection = self.faces_sidebar_list.selection()
@@ -12815,6 +12894,12 @@ class ControlPanel(tk.Tk):
                 photo_id = int(row.get("id"))
             except Exception:
                 photo_id = 0
+            logger.info(
+                "[sync] Tree selection changed. photo_id=%s scope=%s active_person=%s",
+                photo_id,
+                str(self.var_viewer_scope.get() or ""),
+                self._active_face_person_id,
+            )
             self._highlight_map_photo(photo_id if photo_id > 0 else None)
             # La sélection du tableau ne doit pas voler le focus clavier au Treeview.
             self._display_on_viewers(self._abs_path(row["filepath"]), grab_focus=False)

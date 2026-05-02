@@ -1,5 +1,47 @@
 # PhotoSelect — Fichier de Passation
 
+## Mise a jour — 2 mai 2026 (passation visages / albums)
+
+### Resume executif
+- Les exclusions manuelles sont maintenant persistantes pour les albums virtuels auto-geres et pour les affectations visages.
+- Le dedoublonnage par nom de fichier a ete ajoute:
+  - dans les albums virtuels,
+  - dans les regroupements personnes visages.
+- Le bouton radio scope `Visages` reste visible meme si la case `Autorisation de reconnaissance faciale` est decochee.
+
+### Modifications techniques
+
+1. `src/photoselect/database.py`
+- Ajout table `virtual_album_excluded_photos`.
+- Ajout table `face_excluded_assignments`.
+- `remove_photo_from_virtual_album(...)` enregistre une exclusion manuelle.
+- `replace_virtual_album_photos(...)` filtre les exclusions manuelles + dedoublonne par `filename`.
+- `add_photo_to_virtual_album(...)` respecte les exclusions et evite les doublons par `filename` dans l'album.
+- `delete_face_by_thumb(...)` enregistre une exclusion photo/personne.
+- `reassign_face_by_thumb(...)` enregistre exclusion pour l'ancienne personne et nettoie l'exclusion de la nouvelle cible.
+- Ajout helper `person_has_face_from_filename(...)`.
+
+2. `src/photoselect/app.py`
+- `_process_single_face_photo(...)` ignore:
+  - les attributions exclues manuellement,
+  - les doublons par nom de fichier pour une meme personne.
+- Instrumentation logs ajoutee pour tracer les cycles de sync/refresh visages (`[sync]`, `[mosaic]`).
+- `_request_faces_tab_refresh(...)` ne reconstruit plus la mosaique si l'onglet visages n'est pas actif (marquage dirty uniquement).
+- Ajout de compteurs de suppression d'evenements de selection programmes sur sidebars:
+  - `_suppress_virtual_album_select_events`
+  - `_suppress_faces_sidebar_select_events`
+- Correctif UX: `_on_face_recognition_toggle(...)` conserve la visibilite du radio `Visages` en permanence.
+
+### Etat actuel / point d'attention
+- Malgre les gardes ajoutes, l'utilisateur a encore observe des repetitions de logs de selection sur certains parcours.
+- Le comportement est reduit mais pas encore certifie elimine a 100%.
+- Si besoin au prochain fil: ajouter un garde anti-burst sur `_on_tree_select(...)` (meme `photo_id`, meme scope, fenetre temporelle courte).
+
+### Validation effectuee
+- Compilation Python validee apres chaque lot de modifications:
+  - `python -m py_compile src/photoselect/database.py`
+  - `python -m py_compile src/photoselect/app.py`
+
 ## Vue d'Ensemble
 
 **PhotoSelect** est une application de tri photographique en Python/Tkinter avec double fenêtre :

@@ -1,5 +1,21 @@
 # PhotoSelect — Journal de Session (17 avril 2026)
 
+## Mise a jour — 2 mai 2026 (passation rapide)
+
+- Correction appliquee: les photos retirees manuellement des albums auto (themes) ne sont plus re-ajoutees par les scans automatiques.
+- Correction appliquee: exclusions manuelles egalement prises en compte pour les attributions visages (suppression/reaffectation).
+- Correction appliquee: dedoublonnage par nom de fichier dans les albums virtuels et pour les groupes personnes visages.
+- Correctif UX applique: le radio bouton scope `Visages` reste visible meme quand l'autorisation de reconnaissance faciale est decochee.
+
+### Etat en cours
+- Une boucle de synchronisation UI persiste sur le scope visages (selection tableau/sidebar repetee dans certains parcours).
+- Instrumentation de debug ajoutee (`[sync]`, `[mosaic]`) pour tracer les causes (appelant + raison refresh).
+- Un premier garde anti-refresh hors onglet visages est en place.
+- Un garde anti-evenements de selection programmes a ete ajoute sur les sidebars visages/albums.
+
+### Prochaine etape recommandee
+- Ajouter un anti-burst final sur la selection tableau visages (debounce court sur meme `photo_id` + meme scope) si des repetitions residuelles sont confirmees.
+
 ## Résumé
 
 Session de développement intensif portant sur l'ajout de fonctionnalités majeures et la stabilisation de l'interface multi-écrans.
