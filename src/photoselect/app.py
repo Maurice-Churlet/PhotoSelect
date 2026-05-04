@@ -62,6 +62,7 @@ from photoselect.file_manager import (
     generate_thumbnail,
 )
 from photoselect.theme_engine import classify_themes_from_image, get_theme_engine_status
+from photoselect.ui_scaling import AppScaler
 
 try:
     from watchdog.observers import Observer
@@ -93,6 +94,7 @@ ensure_directory(APP_DATA_DIR)
 APP_DB_DIR = APP_DATA_DIR / "databases"
 APP_CACHE_DIR = APP_DATA_DIR / "cache"
 APP_LOG_DIR = APP_DATA_DIR / "logs"
+APP_INSTANCE_FILE = APP_DATA_DIR / "instance.json"
 OPS_LOG_FILE = APP_LOG_DIR / "operations.csv"
 PATH_REGISTRY_DB_FILE = APP_DB_DIR / "_path_registry.sqlite3"
 ALBUM_INDEX_DB_FILE = None    # Sera Source/_PhotoSelect/album_index.sqlite3
@@ -176,6 +178,226 @@ HELP_SHORTCUTS = {
         ("F12 (sur tableau)", "Mode Plein Écran du tableau (si supporté)"),
     ]
 }
+
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+PROCESS_TERMINATE = 0x0001
+SYNCHRONIZE = 0x00100000
+STILL_ACTIVE = 259
+WM_CLOSE = 0x0010
+
+
+def _load_instance_state() -> dict[str, Any]:
+    try:
+        return json.loads(APP_INSTANCE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _current_instance_identity() -> dict[str, str]:
+    process_image = str(Path(sys.executable).resolve())
+    if getattr(sys, "frozen", False):
+        launch_mode = "frozen"
+        entry_path = process_image
+    else:
+        launch_mode = "python-module"
+        entry_path = str(Path(__file__).resolve())
+
+    raw_key = f"{launch_mode}|{process_image}|{entry_path}".encode("utf-8", errors="ignore")
+    return {
+        "launch_mode": launch_mode,
+        "process_image": process_image,
+        "entry_path": entry_path,
+        "instance_key": hashlib.sha1(raw_key).hexdigest(),
+    }
+
+
+def _save_instance_state(pid: int) -> None:
+    identity = _current_instance_identity()
+    payload = {
+        "pid": int(pid),
+        "title": APP_TITLE,
+        "launch_mode": identity["launch_mode"],
+        "process_image": identity["process_image"],
+        "entry_path": identity["entry_path"],
+        "instance_key": identity["instance_key"],
+    }
+    try:
+        APP_INSTANCE_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception as exc:
+        logger.debug("[instance] Impossible d'enregistrer l'etat d'instance: %s", exc)
+
+
+def _clear_instance_state_for_pid(pid: int) -> None:
+    state = _load_instance_state()
+    try:
+        saved_pid = int(state.get("pid") or 0)
+    except Exception:
+        saved_pid = 0
+    if saved_pid != int(pid):
+        return
+    try:
+        APP_INSTANCE_FILE.unlink(missing_ok=True)
+    except Exception as exc:
+        logger.debug("[instance] Impossible de supprimer l'etat d'instance: %s", exc)
+
+
+def _open_process_handle(pid: int, access: int):
+    try:
+        handle = ctypes.windll.kernel32.OpenProcess(access, False, int(pid))
+    except Exception:
+        return 0
+    return handle or 0
+
+
+def _close_process_handle(handle: int) -> None:
+    if handle:
+        try:
+            ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+def _is_process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    handle = _open_process_handle(pid, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return int(exit_code.value) == STILL_ACTIVE
+    finally:
+        _close_process_handle(handle)
+
+
+def _get_process_image_path(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    handle = _open_process_handle(pid, PROCESS_QUERY_LIMITED_INFORMATION)
+    if not handle:
+        return ""
+    try:
+        buffer_len = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(buffer_len.value)
+        if not ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(buffer_len)):
+            return ""
+        raw_path = buffer.value[: buffer_len.value].strip()
+        if not raw_path:
+            return ""
+        try:
+            return str(Path(raw_path).resolve())
+        except Exception:
+            return raw_path
+    finally:
+        _close_process_handle(handle)
+
+
+def _request_process_windows_close(pid: int) -> int:
+    if pid <= 0:
+        return 0
+
+    closed = 0
+    enum_windows = ctypes.windll.user32.EnumWindows
+    get_window_pid = ctypes.windll.user32.GetWindowThreadProcessId
+    is_window = ctypes.windll.user32.IsWindow
+    post_message = ctypes.windll.user32.PostMessageW
+
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @callback_type
+    def _enum_callback(hwnd, _lparam):
+        nonlocal closed
+        target_pid = wintypes.DWORD()
+        get_window_pid(hwnd, ctypes.byref(target_pid))
+        if int(target_pid.value) != int(pid):
+            return True
+        if not is_window(hwnd):
+            return True
+        if post_message(hwnd, WM_CLOSE, 0, 0):
+            closed += 1
+        return True
+
+    try:
+        enum_windows(_enum_callback, 0)
+    except Exception:
+        return closed
+    return closed
+
+
+def _terminate_process(pid: int) -> bool:
+    handle = _open_process_handle(pid, PROCESS_TERMINATE | SYNCHRONIZE)
+    if not handle:
+        return False
+    try:
+        return bool(ctypes.windll.kernel32.TerminateProcess(handle, 0))
+    except Exception:
+        return False
+    finally:
+        _close_process_handle(handle)
+
+
+def _wait_for_process_exit(pid: int, timeout_ms: int) -> bool:
+    handle = _open_process_handle(pid, SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)
+    if not handle:
+        return not _is_process_alive(pid)
+    try:
+        result = ctypes.windll.kernel32.WaitForSingleObject(handle, max(0, int(timeout_ms)))
+        return int(result) == 0
+    finally:
+        _close_process_handle(handle)
+
+
+def _close_previous_instance_if_needed() -> None:
+    state = _load_instance_state()
+    current_identity = _current_instance_identity()
+    try:
+        previous_pid = int(state.get("pid") or 0)
+    except Exception:
+        previous_pid = 0
+
+    current_pid = os.getpid()
+    if previous_pid <= 0 or previous_pid == current_pid:
+        return
+    saved_instance_key = str(state.get("instance_key") or "").strip()
+    if not saved_instance_key or saved_instance_key != current_identity["instance_key"]:
+        logger.info("[instance] Etat ignore: l'instance enregistree ne correspond pas a ce lanceur.")
+        return
+    if not _is_process_alive(previous_pid):
+        _clear_instance_state_for_pid(previous_pid)
+        return
+
+    saved_process_image = str(state.get("process_image") or "").strip()
+    actual_process_image = _get_process_image_path(previous_pid)
+    if saved_process_image and actual_process_image and actual_process_image.casefold() != saved_process_image.casefold():
+        logger.warning(
+            "[instance] Etat d'instance invalide: le pid %s pointe vers %s au lieu de %s.",
+            previous_pid,
+            actual_process_image,
+            saved_process_image,
+        )
+        _clear_instance_state_for_pid(previous_pid)
+        return
+
+    logger.info("[instance] Instance existante detectee (pid=%s), demande de fermeture.", previous_pid)
+    closed_windows = _request_process_windows_close(previous_pid)
+    if closed_windows:
+        if _wait_for_process_exit(previous_pid, 5000):
+            logger.info("[instance] Ancienne instance fermee proprement.")
+            _clear_instance_state_for_pid(previous_pid)
+            return
+        logger.warning("[instance] L'ancienne instance n'a pas termine apres WM_CLOSE, terminaison forcee.")
+    else:
+        logger.warning("[instance] Aucune fenetre detectee pour l'ancienne instance, terminaison forcee.")
+
+    if _terminate_process(previous_pid) and _wait_for_process_exit(previous_pid, 2000):
+        logger.info("[instance] Ancienne instance terminee.")
+        _clear_instance_state_for_pid(previous_pid)
+        return
+
+    logger.warning("[instance] Impossible de fermer l'ancienne instance pid=%s.", previous_pid)
 
 
 def _copy_image_to_clipboard(filepath: Path) -> bool:
@@ -324,6 +546,25 @@ def _get_monitor_rect(x: int, y: int) -> dict[str, int]:
         }
     except Exception:
         return {"x": 0, "y": 0, "width": 1920, "height": 1080}
+
+
+def _get_monitor_work_rect(x: int, y: int) -> dict[str, int]:
+    """Retourne la zone de travail du moniteur (hors barre des taches)."""
+    try:
+        user32 = ctypes.windll.user32
+        pt = POINT(x, y)
+        monitor = user32.MonitorFromPoint(pt, 2)
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        user32.GetMonitorInfoW(monitor, ctypes.byref(mi))
+        return {
+            "x": mi.rcWork.left,
+            "y": mi.rcWork.top,
+            "width": mi.rcWork.right - mi.rcWork.left,
+            "height": mi.rcWork.bottom - mi.rcWork.top,
+        }
+    except Exception:
+        return _get_monitor_rect(x, y)
 
 
 def _get_all_monitors() -> list[dict[str, int]]:
@@ -1817,6 +2058,7 @@ class ControlPanel(tk.Tk):
         self._map_shapes_loaded = False
         self._map_shapes_loading = False
         self._startup_hydration_complete = False
+        self._height_fit_compensation = 0.90
         self._album_virtual_rows: dict[int, dict[str, Any]] = {}
         self._virtual_album_sidebar_rows: list[dict[str, Any]] = []
         self._active_virtual_album_id: int | None = None
@@ -1896,12 +2138,27 @@ class ControlPanel(tk.Tk):
         self._last_notebook_tab_id: str | None = None
         self._notebook_tab_change_guard = False
         
-        # Initialisation du scaling dynamique (Homothétie)
-        self._scaling_base_width = 1600  # Largeur de référence pour le design
-        self._scaling_base_height = 980  # Hauteur de référence pour garantir la visibilité complète
+        # Initialisation du scaling dynamique (cadre logique 16:9)
+        self._scaler = AppScaler(base_width=1920, base_height=1080)
         self._scaling_original_value = self.tk.call('tk', 'scaling')
         self._last_scaled_width = 0
         self._last_scaled_height = 0
+        self._main_ui_container: tk.Frame | None = None
+        self._main_ui_content: tk.Frame | None = None
+        self._frame_config: ttk.Frame | None = None
+        self._frame_virtual_albums: tk.Frame | None = None
+        self._frame_map: tk.Frame | None = None
+        self._frame_logo: tk.Frame | None = None
+        self._frame_table: tk.Frame | None = None
+        self._frame_prog: tk.Frame | None = None
+        self._frame_stats: tk.Frame | None = None
+        self._stats_grid: tk.Frame | None = None
+        self._logo_source_image: Image.Image | None = None
+        self._tree_column_bases: dict[str, int] = {}
+        self._stats_value_labels: list[tk.Label] = []
+        self._stats_runtime_labels: list[tk.Label] = []
+        self._manual_ui_scale_multiplier = 1.0
+        self.var_ui_zoom_percent = tk.StringVar(value="100")
         # Initialisation variables d'état UI
         self.var_face_recognition_enabled = tk.BooleanVar(value=bool(self.config_data.get("face_recognition_enabled", False)))
         self.var_auto_sync_enabled = tk.BooleanVar(value=bool(self.config_data.get("auto_sync_enabled", True)))
@@ -1924,6 +2181,12 @@ class ControlPanel(tk.Tk):
             self.state("normal")
         
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
+        try:
+            self._manual_ui_scale_multiplier = max(0.70, min(1.20, float(self.config_data.get("ui_manual_scale_multiplier", 1.0))))
+        except Exception:
+            self._manual_ui_scale_multiplier = 1.0
+        self._scaler.set_manual_multiplier(self._manual_ui_scale_multiplier)
+        self._sync_manual_ui_scale_var(self._manual_ui_scale_multiplier)
         
         self._set_style()
         self._build_ui()
@@ -1953,8 +2216,10 @@ class ControlPanel(tk.Tk):
         if self.var_auto_sync_enabled.get():
             self.after(3000, self._start_watcher)
 
-        # Force le mode agrandi une seconde fois après un court délai pour garantir le plein écran
+        # Finalise la fenêtre après les premiers layouts sans quitter le mode plein écran contrôlé.
         self.after(200, lambda: self.state("zoomed"))
+        self.after(260, self._finalize_main_window_startup)
+        self.after_idle(self._apply_current_ui_scale)
             
         # Raccourcis clavier (Task 1, 2, 4)
         self.bind_all("<Key-v>", lambda e: self._on_shortcut_mark_face(1))
@@ -1971,6 +2236,12 @@ class ControlPanel(tk.Tk):
         for i in range(1, 4):
             self.bind_all(f"<Control-Key-{i}>", lambda e, idx=i-1: self._move_viewers_to_monitor(idx), add="+")
             self.bind_all(f"<Control-KP_{i}>", lambda e, idx=i-1: self._move_viewers_to_monitor(idx), add="+")
+        self.bind_all("<Control-Up>", self._increase_manual_ui_scale, add="+")
+        self.bind_all("<Control-Right>", self._increase_manual_ui_scale, add="+")
+        self.bind_all("<Control-Down>", self._decrease_manual_ui_scale, add="+")
+        self.bind_all("<Control-Left>", self._decrease_manual_ui_scale, add="+")
+        self.bind_all("<Control-Key-0>", self._reset_manual_ui_scale, add="+")
+        self.bind_all("<Control-KP_0>", self._reset_manual_ui_scale, add="+")
 
     def _toggle_window_groups_focus(self, event: tk.Event | None = None) -> str:
         """Bascule le premier plan entre le panneau principal et le groupe des visionneuses."""
@@ -2030,6 +2301,121 @@ class ControlPanel(tk.Tk):
             except Exception:
                 pass
 
+        return "break"
+
+    def _is_manual_ui_scale_shortcut_allowed(self) -> bool:
+        focus_widget = self.focus_get()
+        editable_widgets = (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox, tk.Listbox, tk.Spinbox)
+        return not (focus_widget is not None and isinstance(focus_widget, editable_widgets))
+
+    def _apply_current_ui_scale(self) -> None:
+        try:
+            new_width = int(self.winfo_width())
+            new_height = int(self.winfo_height())
+            outer_x = int(self.winfo_x())
+            outer_y = int(self.winfo_y())
+            left = int(self.winfo_rootx())
+            top = int(self.winfo_rooty())
+        except Exception:
+            return
+        center_x = left + max(1, new_width // 2)
+        center_y = top + max(1, new_height // 2)
+        metrics = self._get_main_window_work_metrics(center_x, center_y, outer_x, outer_y, left, top, new_width, new_height)
+        effective_width, effective_height = self._get_effective_ui_fit_size(new_width, new_height, metrics)
+        self._scaler.set_manual_multiplier(self._manual_ui_scale_multiplier)
+        self._scaler.update(new_width, new_height, fit_width=effective_width, fit_height=effective_height)
+        ratio = self._scaler.ratio
+        self.tk.call('tk', 'scaling', self._scaling_original_value * ratio)
+        self._update_styles_scaling(ratio)
+        self._apply_main_ui_scaling()
+
+    def _get_effective_ui_fit_size(self, width: int, height: int, metrics: dict[str, int]) -> tuple[int, int]:
+        effective_width = min(width, metrics["max_client_width"])
+        compensated_height_limit = max(1, int(round(metrics["max_client_height"] * self._height_fit_compensation)))
+        effective_height = min(height, compensated_height_limit)
+        return effective_width, effective_height
+
+    def _bring_main_window_to_front(self) -> None:
+        try:
+            self.deiconify()
+        except Exception:
+            pass
+        try:
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+        try:
+            self.attributes("-topmost", True)
+            self.after(900, lambda: self.attributes("-topmost", False))
+        except Exception:
+            pass
+
+    def _finalize_main_window_startup(self) -> None:
+        try:
+            if str(self.state()) == "zoomed":
+                self.update_idletasks()
+                self._apply_current_ui_scale()
+                self._bring_main_window_to_front()
+                return
+        except Exception:
+            pass
+        self._fit_main_window_to_work_area()
+        self._bring_main_window_to_front()
+
+    def _set_manual_ui_scale_multiplier(self, value: float) -> None:
+        clamped = max(0.70, min(1.20, float(value)))
+        self._sync_manual_ui_scale_var(clamped)
+        if abs(clamped - self._manual_ui_scale_multiplier) < 0.0001:
+            return
+        self._manual_ui_scale_multiplier = clamped
+        self._scaler.set_manual_multiplier(clamped)
+        self.config_data["ui_manual_scale_multiplier"] = round(clamped, 3)
+        self._save_config()
+        self._apply_current_ui_scale()
+        percent = int(round(clamped * 100))
+        self._set_sticky_counter_message(f"Taille UI manuelle: {percent}% (Ctrl+0 pour auto)", ttl_sec=4.0)
+
+    def _sync_manual_ui_scale_var(self, value: float | None = None) -> None:
+        multiplier = self._manual_ui_scale_multiplier if value is None else float(value)
+        percent_text = str(int(round(multiplier * 100)))
+        if str(self.var_ui_zoom_percent.get() or "") != percent_text:
+            self.var_ui_zoom_percent.set(percent_text)
+
+    def _get_manual_ui_scale_input(self) -> float:
+        raw = str(self.var_ui_zoom_percent.get() or "").strip().replace(",", ".")
+        if not raw:
+            value = self._manual_ui_scale_multiplier * 100.0
+        else:
+            value = float(raw)
+        percent = max(70.0, min(120.0, value))
+        self._sync_manual_ui_scale_var(percent / 100.0)
+        return percent / 100.0
+
+    def _on_manual_ui_scale_input_commit(self, _event: tk.Event | None = None) -> None:
+        try:
+            multiplier = self._get_manual_ui_scale_input()
+        except Exception:
+            self._sync_manual_ui_scale_var()
+            return
+        self._set_manual_ui_scale_multiplier(multiplier)
+
+    def _increase_manual_ui_scale(self, event: tk.Event | None = None) -> str | None:
+        if not self._is_manual_ui_scale_shortcut_allowed():
+            return None
+        self._set_manual_ui_scale_multiplier(self._manual_ui_scale_multiplier + 0.02)
+        return "break"
+
+    def _decrease_manual_ui_scale(self, event: tk.Event | None = None) -> str | None:
+        if not self._is_manual_ui_scale_shortcut_allowed():
+            return None
+        self._set_manual_ui_scale_multiplier(self._manual_ui_scale_multiplier - 0.02)
+        return "break"
+
+    def _reset_manual_ui_scale(self, event: tk.Event | None = None) -> str | None:
+        if not self._is_manual_ui_scale_shortcut_allowed():
+            return None
+        self._set_manual_ui_scale_multiplier(1.0)
         return "break"
 
     def _move_viewers_to_monitor(self, index: int) -> str:
@@ -2347,6 +2733,7 @@ class ControlPanel(tk.Tk):
             self._ensure_face_worker_running()
             self._start_faces_background_preload_scheduler()
             self._render_map()
+            self.after(200, self._bring_main_window_to_front)
             if self._current_source_dir is not None and (self._startup_cleanup_thread is None or not self._startup_cleanup_thread.is_alive()):
                 self._startup_cleanup_thread = threading.Thread(
                     target=self._deferred_startup_cleanup_worker,
@@ -3540,6 +3927,7 @@ class ControlPanel(tk.Tk):
             "last_viewed_source": "",
             "last_viewed_path": "",
             "show_startup_layout_info": True,
+            "ui_manual_scale_multiplier": 1.0,
             "debug_validate_tree_columns": False,
             "face_recognition_enabled": False,
             "face_engine_backend": "face_recognition",
@@ -3938,15 +4326,21 @@ class ControlPanel(tk.Tk):
         bg_secondary = "#ffffff"
         accent = "#3498db"
         text_color = "#2c3e50"
+        self._bg_main = bg_main
+        self._bg_secondary = bg_secondary
+        self._letterbox_bg = bg_main
+        self._accent_color = accent
+        self._text_color = text_color
+        self._ensure_ui_fonts()
         
-        self.configure(bg=bg_main)
+        self.configure(bg=self._letterbox_bg)
         
         # Style général
-        style.configure(".", background=bg_main, foreground=text_color, font=("Segoe UI", 10))
+        style.configure(".", background=bg_main, foreground=text_color, font=self._ui_fonts["body"])
         
         # LabelFrames
         style.configure("TLabelframe", background=bg_main, foreground=accent, bordercolor="#cbd5e0")
-        style.configure("TLabelframe.Label", background=bg_main, foreground=accent, font=("Segoe UI", 10, "bold"))
+        style.configure("TLabelframe.Label", background=bg_main, foreground=accent, font=self._ui_fonts["body_bold"])
         
         # Treeview
         style.configure("Treeview", 
@@ -3956,7 +4350,7 @@ class ControlPanel(tk.Tk):
                         rowheight=28,
                         borderwidth=0)
         style.map("Treeview", background=[('selected', accent)], foreground=[('selected', 'white')])
-        style.configure("Treeview.Heading", background="#e2e8f0", foreground=text_color, relief="flat", font=("Segoe UI", 10, "bold"))
+        style.configure("Treeview.Heading", background="#e2e8f0", foreground=text_color, relief="flat", font=self._ui_fonts["body_bold"])
         style.map("Treeview.Heading", background=[('active', "#cbd5e0")])
         
         # Progressbar
@@ -3969,6 +4363,218 @@ class ControlPanel(tk.Tk):
         
         # Buttons spéciaux (ceux qui ne sont pas en ttk)
         self.btn_colors = {"bg": "#ecf0f1", "fg": "#2c3e50", "activebackground": accent, "activeforeground": "white", "relief": "flat", "padx": 10, "pady": 5}
+
+    def _ensure_ui_fonts(self) -> None:
+        if hasattr(self, "_ui_fonts"):
+            return
+        self._ui_fonts = {
+            "body": tkfont.Font(family="Segoe UI", size=10),
+            "body_bold": tkfont.Font(family="Segoe UI", size=10, weight="bold"),
+            "body_italic": tkfont.Font(family="Segoe UI", size=10, slant="italic"),
+            "small": tkfont.Font(family="Segoe UI", size=9),
+            "small_bold": tkfont.Font(family="Segoe UI", size=9, weight="bold"),
+            "small_underline": tkfont.Font(family="Segoe UI", size=9, underline=1),
+            "tiny": tkfont.Font(family="Segoe UI", size=8),
+            "tiny_bold": tkfont.Font(family="Segoe UI", size=8, weight="bold"),
+        }
+        self._tk_named_fonts = {
+            "default": tkfont.nametofont("TkDefaultFont"),
+            "text": tkfont.nametofont("TkTextFont"),
+            "fixed": tkfont.nametofont("TkFixedFont"),
+            "menu": tkfont.nametofont("TkMenuFont"),
+            "heading": tkfont.nametofont("TkHeadingFont"),
+            "caption": tkfont.nametofont("TkCaptionFont"),
+            "icon": tkfont.nametofont("TkIconFont"),
+            "tooltip": tkfont.nametofont("TkTooltipFont"),
+        }
+
+    def _update_ui_fonts(self) -> None:
+        self._ensure_ui_fonts()
+        self._ui_fonts["body"].configure(size=self._scaler.font(10), weight="normal", slant="roman", underline=0)
+        self._ui_fonts["body_bold"].configure(size=self._scaler.font(10), weight="bold", slant="roman", underline=0)
+        self._ui_fonts["body_italic"].configure(size=self._scaler.font(10), weight="normal", slant="italic", underline=0)
+        self._ui_fonts["small"].configure(size=self._scaler.font(9), weight="normal", slant="roman", underline=0)
+        self._ui_fonts["small_bold"].configure(size=self._scaler.font(9), weight="bold", slant="roman", underline=0)
+        self._ui_fonts["small_underline"].configure(size=self._scaler.font(9), weight="normal", slant="roman", underline=1)
+        self._ui_fonts["tiny"].configure(size=self._scaler.font(8), weight="normal", slant="roman", underline=0)
+        self._ui_fonts["tiny_bold"].configure(size=self._scaler.font(8), weight="bold", slant="roman", underline=0)
+        self._tk_named_fonts["default"].configure(family="Segoe UI", size=self._scaler.font(10), weight="normal", slant="roman", underline=0)
+        self._tk_named_fonts["text"].configure(family="Segoe UI", size=self._scaler.font(10), weight="normal", slant="roman", underline=0)
+        self._tk_named_fonts["fixed"].configure(family="Consolas", size=self._scaler.font(10), weight="normal", slant="roman", underline=0)
+        self._tk_named_fonts["menu"].configure(family="Segoe UI", size=self._scaler.font(10), weight="normal", slant="roman", underline=0)
+        self._tk_named_fonts["heading"].configure(family="Segoe UI", size=self._scaler.font(10), weight="bold", slant="roman", underline=0)
+        self._tk_named_fonts["caption"].configure(family="Segoe UI", size=self._scaler.font(10), weight="normal", slant="roman", underline=0)
+        self._tk_named_fonts["icon"].configure(family="Segoe UI", size=self._scaler.font(9), weight="normal", slant="roman", underline=0)
+        self._tk_named_fonts["tooltip"].configure(family="Segoe UI", size=self._scaler.font(9), weight="normal", slant="roman", underline=0)
+
+    def _refresh_logo_slot_assets(self) -> None:
+        if self._logo_source_image is None:
+            return
+
+        logo_size = self._scaler.scale(250, minimum=96)
+        logo_padding = self._scaler.scale(20, minimum=12)
+        img = self._logo_source_image.copy()
+        img.thumbnail((logo_size, logo_size), Image.Resampling.LANCZOS)
+        square = Image.new("RGBA", (logo_size, logo_size), (240, 242, 245, 255))
+        offset = ((logo_size - img.width) // 2, (logo_size - img.height) // 2)
+        square.paste(img, offset, img if img.mode in ("RGBA", "LA") else None)
+        self.logo_photo = ImageTk.PhotoImage(square)
+        self._logo_default_photo = self.logo_photo
+        self._logo_slot_size = (self.logo_photo.width(), self.logo_photo.height())
+
+        if self._frame_logo is not None:
+            self._frame_logo.configure(width=self.logo_photo.width() + logo_padding)
+        if self._logo_label is not None:
+            self._logo_label.configure(image=self._logo_default_photo)
+            self._logo_label.image = self._logo_default_photo
+
+        active_path = self._logo_active_path if getattr(self, "_logo_active_path", None) else None
+        if active_path is not None:
+            self._update_logo_preview(active_path)
+
+    def _apply_main_ui_scaling(self) -> None:
+        if self._main_ui_content is None:
+            return
+
+        rect = self._scaler.content_rect
+        self._main_ui_content.place(x=rect.x, y=rect.y, width=rect.width, height=rect.height)
+        self._update_ui_fonts()
+
+        margin = self._scaler.scale(10, minimum=6)
+        block_gap = self._scaler.scale(5, minimum=3)
+        bottom_gap = self._scaler.scale(10, minimum=6)
+        section_gap = self._scaler.scale(16, minimum=10)
+
+        if self._frame_config is not None:
+            self._frame_config.pack_configure(padx=(margin, 0), pady=(margin, margin))
+
+        if self._frame_map is not None:
+            self._frame_map.configure(width=self._scaler.scale(358, minimum=240))
+
+        if self._frame_virtual_albums is not None:
+            album_width = max(self._scaler.scale(220, minimum=160), self._ui_fonts["body"].measure("M" * 25) + self._scaler.scale(34, minimum=18))
+            self._frame_virtual_albums.configure(width=album_width)
+
+        self._refresh_logo_slot_assets()
+
+        if self._frame_config is not None:
+            logo_column_width = 0
+            if self._logo_slot_size is not None:
+                logo_column_width = self._logo_slot_size[0] + self._scaler.scale(20, minimum=12)
+            album_width = self._frame_virtual_albums.winfo_reqwidth() if self._frame_virtual_albums is not None else self._scaler.scale(220, minimum=160)
+            self._frame_config.grid_columnconfigure(4, minsize=max(self._scaler.scale(20, minimum=12), logo_column_width))
+            self._frame_config.grid_columnconfigure(5, minsize=max(self._scaler.scale(220, minimum=160), album_width), weight=0)
+            self._frame_config.grid_columnconfigure(6, minsize=self._scaler.scale(300, minimum=220), weight=1)
+
+        if self._frame_table is not None:
+            self._frame_table.pack_configure(padx=margin, pady=(block_gap, 0))
+        if self._frame_prog is not None:
+            self._frame_prog.pack_configure(padx=margin, pady=(0, block_gap))
+        if self._frame_stats is not None:
+            self._frame_stats.pack_configure(padx=margin, pady=(0, bottom_gap))
+        if self._stats_grid is not None:
+            self._stats_grid.pack_configure(padx=section_gap, pady=section_gap)
+
+        if self._tree_column_bases and hasattr(self, "tree"):
+            for col, width in self._tree_column_bases.items():
+                self.tree.column(col, width=self._scaler.scale(width, minimum=48))
+
+        wraplength = self._scaler.scale(620, minimum=260)
+        for label in self._stats_runtime_labels:
+            label.configure(wraplength=wraplength)
+
+        dot_size = self._scaler.scale(12, minimum=10)
+        inset = max(1, self._scaler.scale(2, minimum=1))
+        if getattr(self, "_face_status_dot_canvas", None) is not None:
+            self._face_status_dot_canvas.configure(width=dot_size, height=dot_size)
+            if self._face_status_dot_item is not None:
+                self._face_status_dot_canvas.coords(self._face_status_dot_item, inset, inset, dot_size - inset, dot_size - inset)
+        if getattr(self, "_theme_status_dot_canvas", None) is not None:
+            self._theme_status_dot_canvas.configure(width=dot_size, height=dot_size)
+            if self._theme_status_dot_item is not None:
+                self._theme_status_dot_canvas.coords(self._theme_status_dot_item, inset, inset, dot_size - inset, dot_size - inset)
+
+    def _fit_main_window_to_work_area(self) -> None:
+        """Rabats la fenetre principale dans la zone de travail du moniteur si elle depasse."""
+        try:
+            self.update_idletasks()
+            outer_x = int(self.winfo_x())
+            outer_y = int(self.winfo_y())
+            left = int(self.winfo_rootx())
+            top = int(self.winfo_rooty())
+            width = int(self.winfo_width())
+            height = int(self.winfo_height())
+        except Exception:
+            return
+
+        center_x = left + max(1, width // 2)
+        center_y = top + max(1, height // 2)
+        metrics = self._get_main_window_work_metrics(center_x, center_y, outer_x, outer_y, left, top, width, height)
+        work_left = metrics["work_left"]
+        work_top = metrics["work_top"]
+        work_width = metrics["work_width"]
+        work_height = metrics["work_height"]
+        work_right = work_left + work_width
+        work_bottom = work_top + work_height
+
+        max_client_width = metrics["max_client_width"]
+        max_client_height = metrics["max_client_height"]
+        border_x = metrics["border_x"]
+        title_bar = metrics["title_bar"]
+        border_y = metrics["border_y"]
+
+        new_width = min(width, max_client_width)
+        new_height = min(height, max_client_height)
+        new_left = max(work_left, min(outer_x, work_right - (new_width + border_x * 2)))
+        new_top = max(work_top, min(outer_y, work_bottom - (new_height + title_bar + border_y)))
+
+        if new_left == outer_x and new_top == outer_y and new_width == width and new_height == height:
+            return
+
+        try:
+            self.state("normal")
+        except Exception:
+            pass
+        self.geometry(f"{new_width}x{new_height}+{new_left}+{new_top}")
+        self.update_idletasks()
+        self._scaler.update(max(1, new_width), max(1, new_height), fit_width=max(1, new_width), fit_height=max(1, new_height))
+        self._update_styles_scaling(self._scaler.ratio)
+        self._apply_main_ui_scaling()
+
+    def _get_main_window_work_metrics(
+        self,
+        center_x: int,
+        center_y: int,
+        outer_x: int,
+        outer_y: int,
+        left: int,
+        top: int,
+        width: int,
+        height: int,
+    ) -> dict[str, int]:
+        work = _get_monitor_work_rect(center_x, center_y)
+        work_left = int(work.get("x", 0))
+        work_top = int(work.get("y", 0))
+        work_width = max(1, int(work.get("width", width)))
+        work_height = max(1, int(work.get("height", height)))
+
+        border_x = max(0, left - outer_x)
+        title_bar = max(0, top - outer_y)
+        border_y = max(0, border_x)
+        safe_margin = 28
+        max_client_width = max(1, work_width - (border_x * 2) - safe_margin)
+        max_client_height = max(1, work_height - title_bar - border_y - safe_margin)
+        return {
+            "work_left": work_left,
+            "work_top": work_top,
+            "work_width": work_width,
+            "work_height": work_height,
+            "border_x": border_x,
+            "title_bar": title_bar,
+            "border_y": border_y,
+            "max_client_width": max_client_width,
+            "max_client_height": max_client_height,
+        }
 
     def _handle_homothety_resize(self, event: tk.Event) -> None:
         """Ajuste le facteur de scaling pour garder toute l'UI visible.
@@ -3989,12 +4595,23 @@ class ControlPanel(tk.Tk):
         self._last_scaled_width = new_width
         self._last_scaled_height = new_height
 
-        ratio_w = new_width / max(1.0, float(self._scaling_base_width))
-        ratio_h = new_height / max(1.0, float(self._scaling_base_height))
-        ratio = min(ratio_w, ratio_h)
+        try:
+            outer_x = int(self.winfo_x())
+            outer_y = int(self.winfo_y())
+            left = int(self.winfo_rootx())
+            top = int(self.winfo_rooty())
+        except Exception:
+            outer_x = 0
+            outer_y = 0
+            left = 0
+            top = 0
+        center_x = left + max(1, new_width // 2)
+        center_y = top + max(1, new_height // 2)
+        metrics = self._get_main_window_work_metrics(center_x, center_y, outer_x, outer_y, left, top, new_width, new_height)
+        effective_width, effective_height = self._get_effective_ui_fit_size(new_width, new_height, metrics)
 
-        # Limiter les tailles extrêmes tout en gardant l'UI lisible.
-        ratio = max(0.55, min(2.0, ratio))
+        self._scaler.update(new_width, new_height, fit_width=effective_width, fit_height=effective_height)
+        ratio = self._scaler.ratio
 
         # Mise à jour du scaling global de Tk (affecte les polices en points)
         new_scaling = self._scaling_original_value * ratio
@@ -4002,13 +4619,18 @@ class ControlPanel(tk.Tk):
 
         # Mise à jour des éléments de style basés sur les pixels
         self._update_styles_scaling(ratio)
+        self._apply_main_ui_scaling()
 
     def _update_styles_scaling(self, ratio: float) -> None:
         """Met à jour les styles TTK qui ne suivent pas automatiquement le scaling global."""
         style = ttk.Style()
+        self._update_ui_fonts()
 
         # Hauteur de ligne du Treeview (pixel-based)
         style.configure("Treeview", rowheight=max(16, int(28 * ratio)))
+        style.configure(".", font=self._ui_fonts["body"])
+        style.configure("TLabelframe.Label", font=self._ui_fonts["body_bold"])
+        style.configure("Treeview.Heading", font=self._ui_fonts["body_bold"])
 
         # Épaisseur de la barre de progression
         style.configure("TProgressbar", thickness=max(8, int(15 * ratio)))
@@ -4021,6 +4643,7 @@ class ControlPanel(tk.Tk):
         try:
             if hasattr(self, 'var_auto_sync_enabled'):
                  self.config_data["auto_sync_enabled"] = bool(self.var_auto_sync_enabled.get())
+            self.config_data["ui_manual_scale_multiplier"] = round(float(getattr(self, "_manual_ui_scale_multiplier", 1.0)), 3)
             if hasattr(self, 'var_geo_mode'):
                 self.config_data["geo_mode"] = self.var_geo_mode.get()
             if hasattr(self, 'var_viewer_mode'):
@@ -7033,9 +7656,16 @@ class ControlPanel(tk.Tk):
         )
 
     def _build_ui(self) -> None:
+        self._main_ui_container = tk.Frame(self, bg=self._letterbox_bg, highlightthickness=0, borderwidth=0)
+        self._main_ui_container.pack(fill=tk.BOTH, expand=True)
+        self._main_ui_content = tk.Frame(self._main_ui_container, bg=self._bg_main, highlightthickness=0, borderwidth=0)
+        self._main_ui_content.place(x=0, y=0, width=1, height=1)
+        ui_parent = self._main_ui_content
+
         # --- DOSSIERS ---
-        frame_config = ttk.Frame(self)
+        frame_config = ttk.Frame(ui_parent)
         frame_config.pack(fill=tk.X, padx=(10, 0), pady=(10, 10))
+        self._frame_config = frame_config
         logo_column_width = 0
 
         # --- LOGO MCh ---
@@ -7054,12 +7684,12 @@ class ControlPanel(tk.Tk):
             
             if logo_path:
                 img = Image.open(logo_path)
-                # Agrandissement significatif
-                img.thumbnail((250, 250), Image.Resampling.LANCZOS)
+                self._logo_source_image = img.copy()
+                img.thumbnail((self._scaler.scale(250, minimum=96), self._scaler.scale(250, minimum=96)), Image.Resampling.LANCZOS)
                 self.logo_photo = ImageTk.PhotoImage(img)
                 self._logo_default_photo = self.logo_photo
                 self._logo_slot_size = (self.logo_photo.width(), self.logo_photo.height())
-                logo_column_width = self.logo_photo.width() + 20
+                logo_column_width = self.logo_photo.width() + self._scaler.scale(20, minimum=12)
                 logger.info("Logo agrandi chargé.")
             else:
                 logger.warning("Fichier logo non trouvé dans les chemins : %s", search_paths)
@@ -7148,7 +7778,7 @@ class ControlPanel(tk.Tk):
 
         # Boutons Action
         frame_btns_host = tk.Frame(frame_config, bg="#f0f2f5")
-        frame_btns_host.grid(row=0, column=3, rowspan=3, padx=15, pady=0, sticky="nw")
+        frame_btns_host.grid(row=0, column=3, rowspan=3, padx=(8, 8), pady=0, sticky="nw")
         frame_btns = tk.Frame(frame_btns_host, bg="#f0f2f5")
         frame_btns.pack(anchor="nw")
         album_sidebar_width = tkfont.nametofont("TkDefaultFont").measure("M" * 25) + 34
@@ -7157,12 +7787,13 @@ class ControlPanel(tk.Tk):
         frame_config.grid_columnconfigure(4, minsize=max(20, logo_column_width))
         frame_config.grid_columnconfigure(5, minsize=max(220, album_sidebar_width), weight=0)
         frame_config.grid_columnconfigure(6, minsize=300, weight=1)
-        # Reserve vertical slack above bottom controls to keep them glued above the table.
-        frame_config.grid_rowconfigure(4, weight=1)
+        # Pas de ligne elastique ici: le bloc controles doit rester juste sous la zone GPS.
+        frame_config.grid_rowconfigure(4, weight=0)
         frame_config.grid_rowconfigure(5, weight=0)
 
-        frame_virtual_albums = tk.Frame(frame_config, bg="#eef3f8", width=max(220, album_sidebar_width), bd=1, relief="solid")
-        frame_virtual_albums.grid(row=0, column=5, rowspan=6, padx=(0, 10), pady=(0, 0), sticky="ns")
+        frame_virtual_albums = tk.Frame(frame_config, bg="#eef3f8", width=max(self._scaler.scale(220, minimum=160), album_sidebar_width), bd=1, relief="solid")
+        frame_virtual_albums.grid(row=0, column=5, rowspan=4, padx=(0, 10), pady=(0, 0), sticky="ns")
+        self._frame_virtual_albums = frame_virtual_albums
         frame_virtual_albums.grid_propagate(False)
         frame_virtual_albums.grid_columnconfigure(0, weight=1)
         frame_virtual_albums.grid_rowconfigure(1, weight=1)
@@ -7173,7 +7804,7 @@ class ControlPanel(tk.Tk):
             textvariable=self.var_virtual_album_header,
             bg="#eef3f8",
             fg="#1f2937",
-            font=("Segoe UI", 10, "bold"),
+            font=self._ui_fonts["body_bold"],
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 4))
 
@@ -7213,8 +7844,9 @@ class ControlPanel(tk.Tk):
         self._virtual_album_ctx_menu.add_command(label="Renommer l'album (F2)", command=self._rename_selected_virtual_album)
         self._virtual_album_ctx_menu.add_command(label="Supprimer l'album", command=self._delete_selected_virtual_album)
 
-        frame_map = tk.Frame(frame_config, bg="#e9eef5", width=358, bd=1, relief="solid")
-        frame_map.grid(row=0, column=6, rowspan=6, padx=(0, 16), pady=(0, 0), sticky="nsew")
+        frame_map = tk.Frame(frame_config, bg="#e9eef5", width=self._scaler.scale(358, minimum=240), bd=1, relief="solid")
+        frame_map.grid(row=0, column=6, rowspan=4, padx=(0, 16), pady=(0, 0), sticky="nsew")
+        self._frame_map = frame_map
         frame_map.grid_propagate(False)
         frame_map.grid_columnconfigure(0, weight=1)
         frame_map.grid_rowconfigure(1, weight=1)
@@ -7224,7 +7856,7 @@ class ControlPanel(tk.Tk):
             text="Planisphere GPS",
             bg="#e9eef5",
             fg="#1f2937",
-            font=("Segoe UI", 10, "bold"),
+            font=self._ui_fonts["body_bold"],
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
 
@@ -7255,12 +7887,13 @@ class ControlPanel(tk.Tk):
             fg="#334155",
             justify="left",
             anchor="w",
-            font=("Segoe UI", 9),
+            font=self._ui_fonts["small"],
         ).grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 3))
 
         if logo_column_width > 0 and hasattr(self, "logo_photo"):
             frame_logo = tk.Frame(frame_config, bg="#f0f2f5", width=logo_column_width)
-            frame_logo.grid(row=0, column=4, rowspan=6, padx=(0, 8), pady=(0, 0), sticky="ns")
+            frame_logo.grid(row=0, column=4, rowspan=4, padx=(0, 8), pady=(0, 0), sticky="n")
+            self._frame_logo = frame_logo
             frame_logo.grid_propagate(False)
             self._logo_label = tk.Label(frame_logo, image=self.logo_photo, borderwidth=0, highlightthickness=0, bg="#f0f2f5")
             self._logo_label.image = self.logo_photo
@@ -7318,7 +7951,7 @@ class ControlPanel(tk.Tk):
 
         # Visionneuse / Affichage + Géo-localisation regroupés en bas, juste au-dessus du tableau.
         frame_bottom_controls = tk.Frame(frame_config, bg="#f0f2f5")
-        frame_bottom_controls.grid(row=5, column=0, columnspan=11, pady=0, sticky="sw")
+        frame_bottom_controls.grid(row=3, column=0, columnspan=4, pady=0, sticky="nw")
 
         frame_face_auth = tk.Frame(frame_bottom_controls, bg="#f0f2f5")
         frame_face_auth.pack(side=tk.TOP, anchor="w", pady=0)
@@ -7368,6 +8001,12 @@ class ControlPanel(tk.Tk):
             **uniform_btn_style,
         )
         self.btn_face_restart.pack(side=tk.LEFT, padx=(8, 2))
+        tk.Label(frame_face_auth, text="Zoom UI :", bg="#f0f2f5").pack(side=tk.LEFT, padx=(10, 4))
+        self.entry_ui_zoom = tk.Entry(frame_face_auth, textvariable=self.var_ui_zoom_percent, width=4)
+        self.entry_ui_zoom.pack(side=tk.LEFT, padx=(0, 2))
+        self.entry_ui_zoom.bind("<Return>", self._on_manual_ui_scale_input_commit)
+        self.entry_ui_zoom.bind("<FocusOut>", self._on_manual_ui_scale_input_commit)
+        tk.Label(frame_face_auth, text="%", bg="#f0f2f5").pack(side=tk.LEFT, padx=(0, 6))
 
         frame_viewer = tk.Frame(frame_bottom_controls, bg="#f0f2f5")
         frame_viewer.pack(side=tk.TOP, anchor="w", pady=0)
@@ -7402,8 +8041,9 @@ class ControlPanel(tk.Tk):
         tk.Radiobutton(frame_geo, text="En ligne (Économe en RAM)", variable=self.var_geo_mode, value="online", bg="#f0f2f5", command=self._save_config).pack(side=tk.LEFT, padx=5)
 
         # --- ONGLETS (TABLEAU + STATISTIQUES) ---
-        frame_table = tk.Frame(self)
+        frame_table = tk.Frame(ui_parent)
         frame_table.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 5))
+        self._frame_table = frame_table
 
         self.notebook = ttk.Notebook(frame_table)
         self.notebook.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -7444,6 +8084,7 @@ class ControlPanel(tk.Tk):
         }
         
         self.tree = ttk.Treeview(tab_table, columns=list(columns.keys()), show="headings", selectmode="extended")
+        self._tree_column_bases = {col: width for col, (_title, width) in columns.items()}
         for col, (title, width) in columns.items():
             self.tree.heading(col, text=title, command=lambda c=col: self._sort_by(c))
             if col in ("date_taken", "country", "copied"):
@@ -7527,6 +8168,7 @@ class ControlPanel(tk.Tk):
 
         stats_grid = tk.Frame(tab_stats, bg="#f8fafc")
         stats_grid.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+        self._stats_grid = stats_grid
         stats_grid.columnconfigure(1, weight=1)
         self._face_status_dot_canvas: tk.Canvas | None = None
         self._face_status_dot_item: int | None = None
@@ -7535,7 +8177,7 @@ class ControlPanel(tk.Tk):
         for i, (key, label) in enumerate(stats_fields):
             var = tk.StringVar(value="-")
             self._stats_vars[key] = var
-            tk.Label(stats_grid, text=label + " :", bg="#f8fafc", fg="#2c3e50", font=("Segoe UI", 10, "bold"), anchor="w").grid(row=i, column=0, sticky="w", pady=3)
+            tk.Label(stats_grid, text=label + " :", bg="#f8fafc", fg="#2c3e50", font=self._ui_fonts["body_bold"], anchor="w").grid(row=i, column=0, sticky="w", pady=3)
             if key in ("face_runtime_status", "theme_runtime_status"):
                 status_frame = tk.Frame(stats_grid, bg="#f8fafc")
                 status_frame.grid(row=i, column=1, sticky="ew", padx=(12, 0), pady=3)
@@ -7549,18 +8191,22 @@ class ControlPanel(tk.Tk):
                 else:
                     self._theme_status_dot_canvas = dot_canvas
                     self._theme_status_dot_item = dot_item
-                tk.Label(
+                runtime_label = tk.Label(
                     status_frame,
                     textvariable=var,
                     bg="#f8fafc",
                     fg="#1f2937",
-                    font=("Segoe UI", 10),
+                    font=self._ui_fonts["body"],
                     anchor="w",
                     justify="left",
                     wraplength=620,
-                ).grid(row=0, column=1, sticky="ew")
+                )
+                runtime_label.grid(row=0, column=1, sticky="ew")
+                self._stats_runtime_labels.append(runtime_label)
             else:
-                tk.Label(stats_grid, textvariable=var, bg="#f8fafc", fg="#1f2937", font=("Segoe UI", 10), anchor="w").grid(row=i, column=1, sticky="ew", padx=(12, 0), pady=3)
+                value_label = tk.Label(stats_grid, textvariable=var, bg="#f8fafc", fg="#1f2937", font=self._ui_fonts["body"], anchor="w")
+                value_label.grid(row=i, column=1, sticky="ew", padx=(12, 0), pady=3)
+                self._stats_value_labels.append(value_label)
 
         self.tab_stats.bind("<Button-3>", self._show_stats_ctx_menu)
         self._bind_stats_context_menu_recursive(stats_grid)
@@ -7607,7 +8253,7 @@ class ControlPanel(tk.Tk):
             justify="left",
             bg="#e2e8f0",
             fg="#334155",
-            font=("Segoe UI", 9, "bold"),
+            font=self._ui_fonts["small_bold"],
         )
         self.lbl_faces_batch_summary.pack(side=tk.LEFT, padx=(12, 0))
         tk.Checkbutton(
@@ -7617,7 +8263,7 @@ class ControlPanel(tk.Tk):
             bg="#e2e8f0",
             fg="#1f2937",
             activebackground="#e2e8f0",
-            font=("Segoe UI", 9),
+            font=self._ui_fonts["small"],
             command=self._on_faces_hide_named_toggled,
         ).pack(side=tk.RIGHT, padx=(8, 0))
         self._refresh_faces_batch_summary()
@@ -7633,7 +8279,7 @@ class ControlPanel(tk.Tk):
             text="Renommage rapide :",
             bg="#f8fafc",
             fg="#0f172a",
-            font=("Segoe UI", 9, "bold"),
+            font=self._ui_fonts["small_bold"],
         ).pack(side=tk.LEFT)
         self.faces_inline_entry = tk.Entry(self.faces_inline_editor_frame, textvariable=self.faces_inline_name_var, width=34)
         self.faces_inline_entry.pack(side=tk.LEFT, padx=(8, 6))
@@ -7692,7 +8338,7 @@ class ControlPanel(tk.Tk):
         # Zone de droite : Sidebar des personnes
         self.faces_sidebar_frame = tk.Frame(self.faces_tab_paned, bg="#f1f5f9", padx=1, pady=1)
         self.faces_tab_paned.add(self.faces_sidebar_frame, width=60)        
-        btn_clear_sid = tk.Button(self.faces_sidebar_frame, text="Tout effacer", command=self._clear_faces_sidebar_selection, font=("Segoe UI", 8, "bold"), bg="#ef4444", fg="white")
+        btn_clear_sid = tk.Button(self.faces_sidebar_frame, text="Tout effacer", command=self._clear_faces_sidebar_selection, font=self._ui_fonts["tiny_bold"], bg="#ef4444", fg="white")
         btn_clear_sid.pack(fill=tk.X, pady=(1, 1))
         
         chk_filter_marked = tk.Checkbutton(
@@ -7701,7 +8347,7 @@ class ControlPanel(tk.Tk):
             variable=self.var_faces_show_only_marked,
             bg="#f1f5f9",
             anchor="w",
-            font=("Segoe UI", 8),
+            font=self._ui_fonts["tiny"],
             command=self._refresh_faces_tab
         )
         chk_filter_marked.pack(fill=tk.X, pady=(0, 2))
@@ -7729,23 +8375,25 @@ class ControlPanel(tk.Tk):
         self._reset_stats_display()
 
         # --- PROGRESSION ---
-        frame_prog = tk.Frame(self, bg="#f0f2f5")
+        frame_prog = tk.Frame(ui_parent, bg="#f0f2f5")
         frame_prog.pack(fill=tk.X, padx=10, pady=(0, 5))
+        self._frame_prog = frame_prog
         self.progress = ttk.Progressbar(frame_prog, orient="horizontal", mode="determinate")
         self.progress.pack(fill=tk.X)
 
         # --- COMPTEURS ---
-        frame_stats = tk.Frame(self, bg="#f0f2f5")
+        frame_stats = tk.Frame(ui_parent, bg="#f0f2f5")
         frame_stats.pack(fill=tk.X, padx=10, pady=(0, 10))
+        self._frame_stats = frame_stats
         
         self.var_counter = tk.StringVar(value="Prêt. Sélectionnez les dossiers.")
         self._counter_last_non_hover_text = self.var_counter.get()
         self.var_counter.trace_add("write", self._on_counter_text_changed)
-        lbl_counter = tk.Label(frame_stats, textvariable=self.var_counter, font=("Segoe UI", 10, "italic"), fg="#2c3e50", bg="#f0f2f5")
+        lbl_counter = tk.Label(frame_stats, textvariable=self.var_counter, font=self._ui_fonts["body_italic"], fg="#2c3e50", bg="#f0f2f5")
         lbl_counter.pack(side=tk.LEFT)
         
         self.var_copies = tk.StringVar(value="Exportées : 0")
-        lbl_copies = tk.Label(frame_stats, textvariable=self.var_copies, font=("Segoe UI", 10, "bold"), fg="#e94560", bg="#f0f2f5")
+        lbl_copies = tk.Label(frame_stats, textvariable=self.var_copies, font=self._ui_fonts["body_bold"], fg="#e94560", bg="#f0f2f5")
         lbl_copies.pack(side=tk.RIGHT)
 
         # Message centre cliquable (coffee tip / donation BTC)
@@ -7753,7 +8401,7 @@ class ControlPanel(tk.Tk):
         self.lbl_coffee_tip = tk.Label(
             frame_stats,
             textvariable=self.var_coffee_tip,
-            font=("Segoe UI", 9, "underline"),
+            font=self._ui_fonts["small_underline"],
             fg="#1d4ed8",
             bg="#f0f2f5",
             cursor="hand2",
@@ -7767,6 +8415,9 @@ class ControlPanel(tk.Tk):
         self.bind("<space>", lambda e: self.copy_current())
         self.bind("<Delete>", self._on_delete_shortcut)
         self.bind("<F1>", lambda e: self._show_help())
+
+        self._sync_manual_ui_scale_var()
+        self._apply_main_ui_scaling()
 
     # ── ACTIONS ET CONTROLES ─────────────────────────────────────────────
 
@@ -13343,7 +13994,7 @@ class ControlPanel(tk.Tk):
                     12,
                     text="Carte en preparation...",
                     fill="#334155",
-                    font=("Segoe UI", 8, "italic"),
+                    font=self._ui_fonts["tiny"],
                     anchor="ne",
                 )
 
@@ -13362,7 +14013,7 @@ class ControlPanel(tk.Tk):
                 y,
                 text=label,
                 fill="#1f2937",
-                font=("Segoe UI", 8, "bold"),
+                font=self._ui_fonts["tiny_bold"],
             )
 
         for lon in range(-120, 181, 60):
@@ -15661,8 +16312,13 @@ def main() -> None:
         ],
     )
     logger.info("[app] Démarrage PhotoSelect. Logs runtime: %s", runtime_log_file)
-    app = ControlPanel()
-    app.mainloop()
+    _close_previous_instance_if_needed()
+    _save_instance_state(os.getpid())
+    try:
+        app = ControlPanel()
+        app.mainloop()
+    finally:
+        _clear_instance_state_for_pid(os.getpid())
 
 
 if __name__ == "__main__":
