@@ -22,6 +22,7 @@ dependencies = [
     "opencv-python>=4.10.0",
     "google-auth-oauthlib>=1.2",
     "requests>=2.31",
+    "watchdog>=4.0",
 ]
 
 [dependency-groups]

@@ -139,3 +139,5 @@ typing-extensions==4.16.0 ; python_full_version < '3.11'
     # via cryptography
 urllib3==2.8.0
     # via requests
+watchdog==6.0.0
+    # via photoselect
