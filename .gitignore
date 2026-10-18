@@ -29,3 +29,8 @@ Desktop.ini
 
 # Project
 output/
+
+# Secrets OAuth Google (le client va dans coffre, jamais dans Git)
+client_secret*.json
+*credentials*.json
+*token*.json
