@@ -14,7 +14,6 @@ import json
 import urllib.parse
 import urllib.request
 import time
-import math
 import csv
 import os
 from dataclasses import dataclass

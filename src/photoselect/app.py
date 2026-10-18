@@ -20,9 +20,9 @@ import random
 import re
 import shutil
 import sqlite3
+import sys
 import threading
 import time
-import urllib.parse
 import unicodedata
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
@@ -39,7 +39,6 @@ from photoselect.database import Database
 from photoselect.face_engine import (
     detect_faces_from_image,
     get_unavailability_reason as get_face_engine_unavailability_reason,
-    get_supported_backends,
     is_available as is_face_engine_available,
     normalize_backend as normalize_face_backend,
 )
@@ -71,10 +70,16 @@ except ImportError:
     Observer = None
     FileSystemEventHandler = None
 
-CONFIG_FILE = Path("photoselect_config.json")
+# En exécutable PyInstaller, la config vit à côté du .exe (indépendant du dossier de démarrage
+# d'un raccourci) ; en développement, dans le dossier courant comme avant.
+CONFIG_FILE = (
+    Path(sys.executable).resolve().parent / "photoselect_config.json"
+    if getattr(sys, "frozen", False)
+    else Path("photoselect_config.json")
+)
 logger = logging.getLogger(__name__)
 
-import sys
+
 def get_resource_path(relative_path: str) -> Path:
     """Retourne le chemin absolu vers une ressource (fonctionne pour dev et PyInstaller)."""
     try:
@@ -2140,10 +2145,18 @@ class ControlPanel(tk.Tk):
         
         # Initialisation du scaling dynamique (cadre logique 16:9)
         self._scaler = AppScaler(base_width=1920, base_height=1080)
-        self._scaling_original_value = self.tk.call('tk', 'scaling')
+        # `tk scaling` reflète le DPI Windows (1.33 à 100 %, 2.0 à 150 %). On ne le modifie plus :
+        # le changer en plus de la taille des polices réduisait le texte deux fois (ratio²).
+        self._scaling_original_value = float(self.tk.call('tk', 'scaling'))
+        self._scaler.set_tk_scaling(self._scaling_original_value)
         self._last_scaled_width = 0
         self._last_scaled_height = 0
         self._main_ui_container: tk.Frame | None = None
+        self._main_ui_canvas: tk.Canvas | None = None
+        self._main_ui_window_item: int | None = None
+        self._main_ui_vscroll: ttk.Scrollbar | None = None
+        self._main_ui_hscroll: ttk.Scrollbar | None = None
+        self._main_ui_fit_job: str | None = None
         self._main_ui_content: tk.Frame | None = None
         self._frame_config: ttk.Frame | None = None
         self._frame_virtual_albums: tk.Frame | None = None
@@ -2169,6 +2182,7 @@ class ControlPanel(tk.Tk):
         self._watcher: Observer | None = None
         self._watcher_handler: PhotoWatcher | None = None
         self._watcher_ui_refresh_job: str | None = None
+        self._watcher_path: str = ""
         
         geom = self.config_data.get("geometry_main", "1150x750")
         self.geometry(geom)
@@ -2324,9 +2338,7 @@ class ControlPanel(tk.Tk):
         effective_width, effective_height = self._get_effective_ui_fit_size(new_width, new_height, metrics)
         self._scaler.set_manual_multiplier(self._manual_ui_scale_multiplier)
         self._scaler.update(new_width, new_height, fit_width=effective_width, fit_height=effective_height)
-        ratio = self._scaler.ratio
-        self.tk.call('tk', 'scaling', self._scaling_original_value * ratio)
-        self._update_styles_scaling(ratio)
+        self._update_styles_scaling(self._scaler.ratio)
         self._apply_main_ui_scaling()
 
     def _get_effective_ui_fit_size(self, width: int, height: int, metrics: dict[str, int]) -> tuple[int, int]:
@@ -2430,33 +2442,6 @@ class ControlPanel(tk.Tk):
                     pass
         return "break"
 
-    def _start_watcher(self) -> None:
-        """Démarre le thread de surveillance du dossier source."""
-        if self._watcher or not self._current_source_dir:
-            return
-        self._watcher = Observer()
-        self._watcher_handler = PhotoWatcher(self)
-        self._watcher.schedule(self._watcher_handler, str(self._current_source_dir), recursive=True)
-        self._watcher.start()
-        logger.info("[watcher] Surveillance démarrée sur %s", self._current_source_dir)
-
-    def _stop_watcher(self) -> None:
-        """Arrête le thread de surveillance."""
-        if self._watcher:
-            self._watcher.stop()
-            self._watcher.join()
-            self._watcher = None
-            self._watcher_handler = None
-            logger.info("[watcher] Surveillance arrêtée.")
-
-    def _on_auto_sync_toggle(self) -> None:
-        """Active/Désactive la surveillance temps réel."""
-        if self.var_auto_sync_enabled.get():
-            self._start_watcher()
-        else:
-            self._stop_watcher()
-        self._save_config()
-
     def _bootstrap_startup_db_load(self) -> None:
         """Charge la base configurée après affichage UI pour accélérer le démarrage perçu."""
         try:
@@ -2508,23 +2493,39 @@ class ControlPanel(tk.Tk):
         """Applique le message de fin d'initialisation selon le contexte courant."""
         self._refresh_contextual_counter(force=True, startup_photo_count=photo_count)
 
-    def _start_watcher(self) -> None:
-        """Démarre la surveillance du dossier source en temps réel."""
+    def _start_watcher(self, folder: Path | str | None = None) -> None:
+        """Démarre la surveillance du dossier source en temps réel.
+
+        Si le watcher surveille déjà un autre dossier (changement de source), il est
+        redémarré : sinon des événements de l'ancien dossier seraient appliqués à la
+        base du nouveau.
+        """
         if Observer is None: return
-        if self._watcher and self._watcher.is_alive(): return
-        
-        path_in = str(self.var_in.get() or "").strip()
+        if not bool(self.var_auto_sync_enabled.get()): return
+
+        path_in = str(folder if folder is not None else (self.var_in.get() or "")).strip()
         if not path_in or not Path(path_in).exists(): return
-        
+
+        if self._watcher and self._watcher.is_alive():
+            try:
+                same_path = Path(self._watcher_path).resolve() == Path(path_in).resolve()
+            except Exception:
+                same_path = self._watcher_path == path_in
+            if same_path:
+                return
+            self._stop_watcher()
+
         try:
             self._watcher_handler = PhotoWatcher(self)
             self._watcher = Observer()
             self._watcher.schedule(self._watcher_handler, path_in, recursive=True)
             self._watcher.start()
+            self._watcher_path = path_in
             logger.info("[watcher] Service de surveillance démarré sur: %s", path_in)
         except Exception as e:
             logger.error("[watcher] Erreur démarrage: %s", e)
             self._watcher = None
+            self._watcher_path = ""
 
     def _stop_watcher(self) -> None:
         """Arrête le service de surveillance."""
@@ -2534,6 +2535,7 @@ class ControlPanel(tk.Tk):
                 self._watcher.join(timeout=2.0)
             except Exception: pass
             self._watcher = None
+            self._watcher_path = ""
             logger.info("[watcher] Service de surveillance arrêté.")
 
     def _on_auto_sync_toggle(self) -> None:
@@ -2557,41 +2559,16 @@ class ControlPanel(tk.Tk):
 
     def _apply_watcher_ui_refresh(self) -> None:
         self._watcher_ui_refresh_job = None
+        # Noms de collection recalculés une seule fois par rafale d'ajouts (comme en fin de scan).
+        if getattr(self, "_watcher_collection_names_dirty", False) and self.db:
+            self._watcher_collection_names_dirty = False
+            try:
+                self.db.update_collection_names()
+            except Exception as e:
+                logger.error("[watcher] Erreur mise à jour noms de collection: %s", e)
         self._update_statistics()
         if not self._is_searching and not self._is_album_scope_active():
             self._load_data_to_treeview()
-
-    def _sync_single_file_from_watcher(self, path: Path) -> None:
-        """Synchronise un fichier spécifique ajouté/modifié sur le disque."""
-        if not self.db or not path.exists(): return
-        try:
-            meta = extract_all_metadata(path)
-            meta["filepath"] = self._rel_path(path)
-            self.db.upsert_photo(meta)
-            logger.info("[watcher] Synchronisé: %s", path.name)
-            
-            # Relancer les workers IA pour traiter le nouveau fichier
-            self.after(500, self._ensure_face_worker_running)
-            self.after(500, self._ensure_theme_worker_running)
-
-            if not self._scan_thread or not self._scan_thread.is_alive():
-                self.after(100, self._load_data_to_treeview)
-                self.after(200, self._update_statistics)
-        except Exception as e:
-            logger.error("[watcher] Erreur sync %s: %s", path.name, e)
-
-    def _sync_deletion_from_watcher(self, path: Path) -> None:
-        """Supprime une photo de la base si elle est effacée du disque."""
-        if not self.db: return
-        try:
-            rel_p = self._rel_path(path)
-            self.db.remove_photo_by_path(rel_p)
-            logger.info("[watcher] Supprimé de la base: %s", path.name)
-            if not self._scan_thread or not self._scan_thread.is_alive():
-                self.after(500, self._load_data_to_treeview)
-                self.after(600, self._update_statistics)
-        except Exception as e:
-            logger.error("[watcher] Erreur suppression %s: %s", path.name, e)
 
     def _cancel_pending_startup_load(self) -> int:
         self._startup_load_token += 1
@@ -4436,8 +4413,6 @@ class ControlPanel(tk.Tk):
         if self._main_ui_content is None:
             return
 
-        rect = self._scaler.content_rect
-        self._main_ui_content.place(x=rect.x, y=rect.y, width=rect.width, height=rect.height)
         self._update_ui_fonts()
 
         margin = self._scaler.scale(10, minimum=6)
@@ -4449,10 +4424,10 @@ class ControlPanel(tk.Tk):
             self._frame_config.pack_configure(padx=(margin, 0), pady=(margin, margin))
 
         if self._frame_map is not None:
-            self._frame_map.configure(width=self._scaler.scale(358, minimum=240))
+            self._frame_map.configure(width=self._scaler.scale(300, minimum=160))
 
         if self._frame_virtual_albums is not None:
-            album_width = max(self._scaler.scale(220, minimum=160), self._ui_fonts["body"].measure("M" * 25) + self._scaler.scale(34, minimum=18))
+            album_width = max(self._scaler.scale(220, minimum=160), self._ui_fonts["body"].measure("0" * 20) + self._scaler.scale(34, minimum=18))
             self._frame_virtual_albums.configure(width=album_width)
 
         self._refresh_logo_slot_assets()
@@ -4464,7 +4439,7 @@ class ControlPanel(tk.Tk):
             album_width = self._frame_virtual_albums.winfo_reqwidth() if self._frame_virtual_albums is not None else self._scaler.scale(220, minimum=160)
             self._frame_config.grid_columnconfigure(4, minsize=max(self._scaler.scale(20, minimum=12), logo_column_width))
             self._frame_config.grid_columnconfigure(5, minsize=max(self._scaler.scale(220, minimum=160), album_width), weight=0)
-            self._frame_config.grid_columnconfigure(6, minsize=self._scaler.scale(300, minimum=220), weight=1)
+            self._frame_config.grid_columnconfigure(6, minsize=self._scaler.scale(300, minimum=160), weight=1)
 
         if self._frame_table is not None:
             self._frame_table.pack_configure(padx=margin, pady=(block_gap, 0))
@@ -4493,6 +4468,74 @@ class ControlPanel(tk.Tk):
             self._theme_status_dot_canvas.configure(width=dot_size, height=dot_size)
             if self._theme_status_dot_item is not None:
                 self._theme_status_dot_canvas.coords(self._theme_status_dot_item, inset, inset, dot_size - inset, dot_size - inset)
+
+        self._schedule_main_ui_fit()
+
+    def _schedule_main_ui_fit(self) -> None:
+        """Regroupe les recalculs de taille du contenu (un seul passage par cycle idle)."""
+        if self._main_ui_fit_job is not None:
+            return
+        self._main_ui_fit_job = self.after_idle(self._fit_main_ui_content)
+
+    def _get_main_ui_min_size(self) -> tuple[int, int]:
+        """Taille minimale lisible : bandeau du haut entier + tableau réduit + bas de page."""
+        margin = self._scaler.scale(10, minimum=6)
+        min_width = margin * 2
+        min_height = margin * 2
+        if self._frame_config is not None:
+            min_width += self._frame_config.winfo_reqwidth()
+            min_height += self._frame_config.winfo_reqheight() + margin
+        min_height += self._scaler.scale(200, minimum=160)
+        for frame in (self._frame_prog, self._frame_stats):
+            if frame is not None:
+                min_height += frame.winfo_reqheight() + margin
+        return min_width, min_height
+
+    def _fit_main_ui_content(self) -> None:
+        """Étire le contenu à la fenêtre, ou affiche des barres de défilement si elle est trop petite."""
+        self._main_ui_fit_job = None
+        canvas = self._main_ui_canvas
+        if canvas is None or self._main_ui_window_item is None or self._main_ui_container is None:
+            return
+        try:
+            available_w = int(self._main_ui_container.winfo_width())
+            available_h = int(self._main_ui_container.winfo_height())
+        except Exception:
+            return
+        if available_w <= 1 or available_h <= 1:
+            return
+
+        min_w, min_h = self._get_main_ui_min_size()
+        need_h_scroll = min_w > available_w
+        need_v_scroll = min_h > available_h
+        bar = self._scaler.scale(16, minimum=14)
+        # Une barre visible réduit la place disponible dans l'autre sens.
+        if need_h_scroll and not need_v_scroll:
+            need_v_scroll = min_h > available_h - bar
+        if need_v_scroll and not need_h_scroll:
+            need_h_scroll = min_w > available_w - bar
+        view_w = available_w - (bar if need_v_scroll else 0)
+        view_h = available_h - (bar if need_h_scroll else 0)
+
+        for scrollbar, needed, grid_opts in (
+            (self._main_ui_vscroll, need_v_scroll, {"row": 0, "column": 1, "sticky": "ns"}),
+            (self._main_ui_hscroll, need_h_scroll, {"row": 1, "column": 0, "sticky": "ew"}),
+        ):
+            if scrollbar is None:
+                continue
+            if needed:
+                scrollbar.grid(**grid_opts)
+            else:
+                scrollbar.grid_remove()
+
+        content_w = max(view_w, min_w)
+        content_h = max(view_h, min_h)
+        canvas.itemconfigure(self._main_ui_window_item, width=content_w, height=content_h)
+        canvas.configure(scrollregion=(0, 0, content_w, content_h))
+        if not need_h_scroll:
+            canvas.xview_moveto(0)
+        if not need_v_scroll:
+            canvas.yview_moveto(0)
 
     def _fit_main_window_to_work_area(self) -> None:
         """Rabats la fenetre principale dans la zone de travail du moniteur si elle depasse."""
@@ -4611,14 +4654,9 @@ class ControlPanel(tk.Tk):
         effective_width, effective_height = self._get_effective_ui_fit_size(new_width, new_height, metrics)
 
         self._scaler.update(new_width, new_height, fit_width=effective_width, fit_height=effective_height)
-        ratio = self._scaler.ratio
 
-        # Mise à jour du scaling global de Tk (affecte les polices en points)
-        new_scaling = self._scaling_original_value * ratio
-        self.tk.call('tk', 'scaling', new_scaling)
-
-        # Mise à jour des éléments de style basés sur les pixels
-        self._update_styles_scaling(ratio)
+        # Polices (points) + éléments de style basés sur les pixels
+        self._update_styles_scaling(self._scaler.ratio)
         self._apply_main_ui_scaling()
 
     def _update_styles_scaling(self, ratio: float) -> None:
@@ -4626,18 +4664,15 @@ class ControlPanel(tk.Tk):
         style = ttk.Style()
         self._update_ui_fonts()
 
-        # Hauteur de ligne du Treeview (pixel-based)
-        style.configure("Treeview", rowheight=max(16, int(28 * ratio)))
+        # Hauteur de ligne du Treeview (pixels) : jamais plus petite que la police elle-même.
+        linespace = int(self._ui_fonts["body"].metrics("linespace"))
+        style.configure("Treeview", rowheight=max(self._scaler.scale(28, minimum=16), linespace + 6))
         style.configure(".", font=self._ui_fonts["body"])
         style.configure("TLabelframe.Label", font=self._ui_fonts["body_bold"])
         style.configure("Treeview.Heading", font=self._ui_fonts["body_bold"])
 
         # Épaisseur de la barre de progression
-        style.configure("TProgressbar", thickness=max(8, int(15 * ratio)))
-
-        # On peut aussi ajuster les polices explicitement si nécessaire, 
-        # mais 'tk scaling' gère déjà la plupart des cas.
-        # Note: Certains widgets Tk (non-ttk) peuvent nécessiter un rafraîchissement.
+        style.configure("TProgressbar", thickness=self._scaler.scale(15, minimum=8))
 
     def _save_config(self) -> None:
         try:
@@ -7656,10 +7691,20 @@ class ControlPanel(tk.Tk):
         )
 
     def _build_ui(self) -> None:
+        # Conteneur défilant : l'UI occupe toute la fenêtre, et des barres de défilement
+        # n'apparaissent que si la fenêtre est plus petite que le minimum lisible.
         self._main_ui_container = tk.Frame(self, bg=self._letterbox_bg, highlightthickness=0, borderwidth=0)
         self._main_ui_container.pack(fill=tk.BOTH, expand=True)
-        self._main_ui_content = tk.Frame(self._main_ui_container, bg=self._bg_main, highlightthickness=0, borderwidth=0)
-        self._main_ui_content.place(x=0, y=0, width=1, height=1)
+        self._main_ui_container.grid_rowconfigure(0, weight=1)
+        self._main_ui_container.grid_columnconfigure(0, weight=1)
+        self._main_ui_canvas = tk.Canvas(self._main_ui_container, bg=self._bg_main, highlightthickness=0, borderwidth=0)
+        self._main_ui_canvas.grid(row=0, column=0, sticky="nsew")
+        self._main_ui_vscroll = ttk.Scrollbar(self._main_ui_container, orient=tk.VERTICAL, command=self._main_ui_canvas.yview)
+        self._main_ui_hscroll = ttk.Scrollbar(self._main_ui_container, orient=tk.HORIZONTAL, command=self._main_ui_canvas.xview)
+        self._main_ui_canvas.configure(yscrollcommand=self._main_ui_vscroll.set, xscrollcommand=self._main_ui_hscroll.set)
+        self._main_ui_content = tk.Frame(self._main_ui_canvas, bg=self._bg_main, highlightthickness=0, borderwidth=0)
+        self._main_ui_window_item = self._main_ui_canvas.create_window((0, 0), window=self._main_ui_content, anchor="nw")
+        self._main_ui_canvas.bind("<Configure>", lambda _e: self._schedule_main_ui_fit())
         ui_parent = self._main_ui_content
 
         # --- DOSSIERS ---
@@ -7723,7 +7768,7 @@ class ControlPanel(tk.Tk):
             textvariable=self.var_in,
             values=self._saved_source_paths,
             state="readonly",
-            width=33,
+            width=28,
         )
         self.selector_in.grid(row=0, column=1, pady=(0, 3), sticky="w")
         self.selector_in.bind("<<ComboboxSelected>>", self._on_source_selector_changed)
@@ -7733,7 +7778,7 @@ class ControlPanel(tk.Tk):
         # Recherche
         self.lbl_search = tk.Label(frame_selectors, text="Rechercher :", anchor="w", bg="#f0f2f5")
         self.lbl_search.grid(row=3, column=0, padx=(5, 2), pady=0, sticky="w")
-        self.entry_search = tk.Entry(frame_selectors, textvariable=self.var_search, width=35)
+        self.entry_search = tk.Entry(frame_selectors, textvariable=self.var_search, width=30)
         self.entry_search.grid(row=3, column=1, pady=0, sticky="w")
         self.var_search.trace_add("write", lambda *_: self._on_search_changed())
         self.btn_search_clear = tk.Button(frame_selectors, text="Effacer", width=12, command=lambda: self.var_search.set(""), **uniform_btn_style)
@@ -7762,7 +7807,7 @@ class ControlPanel(tk.Tk):
         # Filtre GPS (coordonnées + rayon)
         lbl_gps = tk.Label(frame_selectors, text="GPS :", anchor="w", bg="#f0f2f5")
         lbl_gps.grid(row=5, column=0, padx=(5, 2), pady=(4, 0), sticky="w")
-        self.entry_gps_filter = tk.Entry(frame_selectors, textvariable=self.var_gps_filter, width=35)
+        self.entry_gps_filter = tk.Entry(frame_selectors, textvariable=self.var_gps_filter, width=30)
         self.entry_gps_filter.grid(row=5, column=1, pady=(4, 0), sticky="w")
         self.var_gps_filter.trace_add("write", lambda *_: self._on_gps_filter_changed())
         frame_gps_zone = tk.Frame(frame_selectors, bg="#f0f2f5")
@@ -7781,7 +7826,7 @@ class ControlPanel(tk.Tk):
         frame_btns_host.grid(row=0, column=3, rowspan=3, padx=(8, 8), pady=0, sticky="nw")
         frame_btns = tk.Frame(frame_btns_host, bg="#f0f2f5")
         frame_btns.pack(anchor="nw")
-        album_sidebar_width = tkfont.nametofont("TkDefaultFont").measure("M" * 25) + 34
+        album_sidebar_width = tkfont.nametofont("TkDefaultFont").measure("0" * 20) + 34
 
         # Colonnes dediees: logo puis albums puis planisphere.
         frame_config.grid_columnconfigure(4, minsize=max(20, logo_column_width))
@@ -7815,7 +7860,7 @@ class ControlPanel(tk.Tk):
 
         self.list_virtual_albums = tk.Listbox(
             frame_virtual_album_list,
-            width=25,
+            width=20,
             exportselection=False,
             activestyle="none",
             takefocus=1,
@@ -7844,7 +7889,7 @@ class ControlPanel(tk.Tk):
         self._virtual_album_ctx_menu.add_command(label="Renommer l'album (F2)", command=self._rename_selected_virtual_album)
         self._virtual_album_ctx_menu.add_command(label="Supprimer l'album", command=self._delete_selected_virtual_album)
 
-        frame_map = tk.Frame(frame_config, bg="#e9eef5", width=self._scaler.scale(358, minimum=240), bd=1, relief="solid")
+        frame_map = tk.Frame(frame_config, bg="#e9eef5", width=self._scaler.scale(300, minimum=160), bd=1, relief="solid")
         frame_map.grid(row=0, column=6, rowspan=4, padx=(0, 16), pady=(0, 0), sticky="nsew")
         self._frame_map = frame_map
         frame_map.grid_propagate(False)
@@ -8096,8 +8141,10 @@ class ControlPanel(tk.Tk):
             self.tree.column(col, width=width, anchor=anchor)
 
         scrollbar = ttk.Scrollbar(tab_table, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscroll=scrollbar.set)
-        
+        tree_hscroll = ttk.Scrollbar(tab_table, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscroll=scrollbar.set, xscrollcommand=tree_hscroll.set)
+
+        tree_hscroll.pack(side=tk.BOTTOM, fill=tk.X)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -8375,17 +8422,19 @@ class ControlPanel(tk.Tk):
         self._reset_stats_display()
 
         # --- PROGRESSION ---
+        # Packés côté bas *avant* le tableau : si la hauteur manque, c'est le tableau qui
+        # rétrécit, et non la progression ou les compteurs qui disparaissent.
+        frame_stats = tk.Frame(ui_parent, bg="#f0f2f5")
+        frame_stats.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10), before=frame_table)
+        self._frame_stats = frame_stats
+
         frame_prog = tk.Frame(ui_parent, bg="#f0f2f5")
-        frame_prog.pack(fill=tk.X, padx=10, pady=(0, 5))
+        frame_prog.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5), before=frame_table)
         self._frame_prog = frame_prog
         self.progress = ttk.Progressbar(frame_prog, orient="horizontal", mode="determinate")
         self.progress.pack(fill=tk.X)
 
         # --- COMPTEURS ---
-        frame_stats = tk.Frame(ui_parent, bg="#f0f2f5")
-        frame_stats.pack(fill=tk.X, padx=10, pady=(0, 10))
-        self._frame_stats = frame_stats
-        
         self.var_counter = tk.StringVar(value="Prêt. Sélectionnez les dossiers.")
         self._counter_last_non_hover_text = self.var_counter.get()
         self.var_counter.trace_add("write", self._on_counter_text_changed)
@@ -12033,14 +12082,17 @@ class ControlPanel(tk.Tk):
         try:
             # On vérifie si déjà là
             rel = self._rel_path(path)
-            existing = self.db.get_photo_by_filepath(rel)
+            existing = self.db.get_photo_by_path(rel)
             if existing:
                 return
             
             # Nouveau fichier: on extrait les métas
-            meta = extract_all_metadata(path)
+            geo_mode = str(self.var_geo_mode.get() or "local") if hasattr(self, "var_geo_mode") else "local"
+            meta = extract_all_metadata(path, mode=geo_mode if geo_mode in ("local", "online") else "local")
+            meta["filesize"] = get_file_size(path)
             meta["filepath"] = rel
             self.db.insert_photos([meta])
+            self._watcher_collection_names_dirty = True
             logger.info("[watcher] Sync ajout: %s", path.name)
             self._invalidate_duplicate_cache()
             
@@ -12082,6 +12134,10 @@ class ControlPanel(tk.Tk):
             except Exception: pass
 
         self._init_project_paths(folder_path)
+        # Le watcher doit suivre le dossier source actif (délai: ne pas ralentir l'ouverture).
+        if self._watcher is not None:
+            self._stop_watcher()
+        self.after(3000, lambda p=folder_path: self._start_watcher(p))
         db_file = self._get_db_file_for_source(folder_path)
         logger.info("[db] Ouverture de la base : %s", db_file.resolve())
         legacy_db = folder_path / ".photoselect.db"
@@ -13545,6 +13601,16 @@ class ControlPanel(tk.Tk):
                 photo_id = int(row.get("id"))
             except Exception:
                 photo_id = 0
+            # Garde anti-rafale : une resélection programmatique de la même photo (rafraîchissement
+            # de la mosaïque Visages, rechargement du tableau) ne doit pas relancer toute la chaîne.
+            scope = str(self.var_viewer_scope.get() or "")
+            now = time.monotonic()
+            last_key = getattr(self, "_last_tree_select_key", None)
+            last_time = float(getattr(self, "_last_tree_select_time", 0.0))
+            self._last_tree_select_key = (photo_id, scope)
+            self._last_tree_select_time = now
+            if photo_id > 0 and last_key == (photo_id, scope) and (now - last_time) < 0.4:
+                return
             logger.info(
                 "[sync] Tree selection changed. photo_id=%s scope=%s active_person=%s",
                 photo_id,

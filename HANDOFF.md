@@ -1,5 +1,31 @@
 # PhotoSelect — Fichier de Passation
 
+## Mise a jour — 14 octobre 2026 (petits ecrans + bugs)
+
+### Affichage / petits ecrans
+- Cause principale: double reduction des polices (`tk scaling` x ratio PUIS taille de police x ratio = ratio²).
+  En 1366x768 le texte tombait a ~5 pt et la barre de progression + compteurs sortaient de la fenetre.
+- `tk scaling` n'est plus modifie (garde la valeur DPI Windows). `AppScaler` raisonne en pixels logiques
+  (independant du zoom Windows 125/150 %) ; polices plancher 8 pt.
+- Progression et compteurs packes en bas *avant* le tableau : c'est le tableau qui retrecit.
+- Conteneur principal defilant (`_fit_main_ui_content`) : barres de defilement seulement si la fenetre est
+  sous la taille minimale lisible (1366x768 : aucune barre ; 1280x720 et moins : defilement horizontal).
+- Largeurs resserrees: champs source/recherche/GPS (28/30 car.), colonne Albums (20 car.), carte min 160 px.
+- Barre de defilement horizontale ajoutee au tableau.
+
+### Bugs corriges
+- Synchro temps reel: l'ajout de fichier plantait (`get_photo_by_filepath` inexistant) -> `get_photo_by_path`,
+  taille fichier + noms de collection recalcules une fois par rafale.
+- Watcher: redemarre sur le nouveau dossier quand la source change (avant: restait sur l'ancien dossier).
+- Methodes dupliquees supprimees (`_start_watcher`, `_stop_watcher`, `_on_auto_sync_toggle`,
+  `_sync_single_file_from_watcher`, `_sync_deletion_from_watcher`) : seules les versions actives restent.
+- Garde anti-rafale dans `_on_tree_select` (meme photo + meme scope < 0,4 s ignore) contre la boucle
+  tableau <-> mosaique Visages.
+- `CONFIG_FILE` a cote du .exe en mode PyInstaller (independant du dossier de demarrage du raccourci).
+
+### Tests
+- `tests/test_ui_scaling.py` (pytest) : `PYTHONPATH=src python -m pytest tests`
+
 ## Mise a jour — 2 mai 2026 (passation visages / albums)
 
 ### Resume executif
