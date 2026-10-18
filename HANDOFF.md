@@ -48,7 +48,7 @@
     libere l'interface ; avertissement avant envoi strip de fichiers non JPEG ;
   - journaux `requests_oauthlib`/`oauthlib`/`urllib3` bridees a WARNING (jetons en clair en DEBUG) ;
   - connexions SQLite fermees ; `poll()` tolere la fermeture de l'app.
-- 31 tests OK (26 Google Photos dont 9 de non-regression, 5 scaling). Reste : premier envoi reel par Maurice (voir README « Premier essai »).
+- 36 tests OK. Premier envoi reel valide par Maurice le 18/10/2026 (consentement OAuth, album, retrait GPS).
 
 ## Mise a jour — 14 octobre 2026 (petits ecrans + bugs)
 
