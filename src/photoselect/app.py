@@ -3176,8 +3176,74 @@ class ControlPanel(GooglePhotosMixin, tk.Tk):
         scope = str(self.var_viewer_scope.get() or "folder")
         if scope == "faces":
             self._refresh_faces_sidebar(select_active=select_active)
+        elif scope == "folder":
+            self._refresh_folder_sidebar()
         else:
             self._refresh_virtual_album_sidebar(select_active=select_active)
+
+    def _active_folder_filter_name(self) -> str:
+        """Nom du dossier du filtre « Dossier=… » de la recherche, sinon chaîne vide."""
+        current = str(self.var_search.get() or "").strip() if hasattr(self, "var_search") else ""
+        match = re.match(r"^\s*dossier\s*=\s*(.+?)\s*$", current, re.I)
+        return match.group(1) if match else ""
+
+    def _refresh_folder_sidebar(self) -> None:
+        """Mode « Par dossier » : liste des dossiers (nombre de photos) dans la barre latérale."""
+        if not self.db or not hasattr(self, "list_virtual_albums"):
+            return
+        # Regroupement sur la même clé que le filtre « Dossier= » (sans accents, insensible à la casse).
+        grouped: dict[str, list[Any]] = {}
+        for name, count in self.db.get_directory_counts().items():
+            key = _remove_accents(name.lower())
+            if key in grouped:
+                grouped[key][1] += count
+            else:
+                grouped[key] = [name, count]
+        folders = sorted(grouped.items(), key=lambda kv: kv[0])
+
+        self.var_virtual_album_header.set(f"Dossiers ({len(folders)})")
+        active_key = _remove_accents(self._active_folder_filter_name().lower())
+        listbox = self.list_virtual_albums
+        self._last_faces_sidebar_structure = None  # la liste ne montre plus les visages
+        self._virtual_album_listbox_syncing = True
+        try:
+            listbox.configure(state="normal")
+            listbox.delete(0, tk.END)
+            self._virtual_album_sidebar_rows = []
+            for key, (name, count) in folders:
+                listbox.insert(tk.END, f"{name} ({count})")
+                self._virtual_album_sidebar_rows.append({"type": "folder", "name": name})
+                if key == active_key:
+                    index = listbox.size() - 1
+                    listbox.selection_set(index)
+                    listbox.activate(index)
+                    listbox.see(index)
+            if not folders:
+                listbox.configure(state="disabled")
+        finally:
+            self._virtual_album_listbox_syncing = False
+
+    def _show_folder_from_sidebar(self, folder_name: str) -> None:
+        """Affiche uniquement le dossier choisi dans la barre latérale, puis sa première photo."""
+        new_filter = f"Dossier={folder_name}"
+        if str(self.var_search.get() or "") != new_filter:
+            self.var_search.set(new_filter)
+        self._scope_injected_search_filter = new_filter
+        self._scope_injected_search_armed = True
+        if hasattr(self, "_search_timer"):
+            try:
+                self.after_cancel(self._search_timer)
+            except Exception:
+                pass
+        self._load_data_to_treeview()
+        children = self.tree.get_children()
+        if children:
+            first = children[0]
+            self.tree.selection_set(first)
+            self.tree.focus(first)
+            self.tree.see(first)
+        self._update_statistics()
+        self._refresh_contextual_counter(force=True)
 
     def _refresh_faces_sidebar(self, select_active: bool = True) -> None:
         """Affiche la liste des visages reconnus dans la barre latérale."""
@@ -3237,6 +3303,11 @@ class ControlPanel(GooglePhotosMixin, tk.Tk):
             self._active_virtual_album_name = ""
             self.config_data["last_virtual_album_name"] = ""
 
+        if hasattr(self, "var_viewer_scope") and str(self.var_viewer_scope.get() or "") == "folder":
+            # En mode « Par dossier », la barre latérale montre les dossiers, pas les albums.
+            self._refresh_folder_sidebar()
+            return
+
         if hasattr(self, "var_virtual_album_header"):
             self.var_virtual_album_header.set(f"Albums ({len(rows)})")
 
@@ -3244,6 +3315,7 @@ class ControlPanel(GooglePhotosMixin, tk.Tk):
             return
 
         listbox = self.list_virtual_albums
+        self._last_faces_sidebar_structure = None  # la liste ne montre plus les visages
         self._virtual_album_listbox_syncing = True
         try:
             listbox.configure(state="normal")
@@ -3296,9 +3368,10 @@ class ControlPanel(GooglePhotosMixin, tk.Tk):
     def _on_virtual_album_listbox_select(self, _event: tk.Event | None = None) -> None:
         if self._virtual_album_listbox_syncing or not hasattr(self, "list_virtual_albums"):
             return
-        if int(getattr(self, "_suppress_virtual_album_select_events", 0)) > 0:
-            self._suppress_virtual_album_select_events = max(0, int(self._suppress_virtual_album_select_events) - 1)
-            return
+        # Tk n'émet <<ListboxSelect>> que pour un clic ou une touche de l'utilisateur, jamais pour un
+        # selection_set() du programme : les « événements à ignorer » comptés lors des resélections
+        # automatiques n'arrivent donc jamais, et le compteur avalait le clic suivant de l'utilisateur.
+        self._suppress_virtual_album_select_events = 0
 
         selection = self.list_virtual_albums.curselection()
         if not selection:
@@ -3310,6 +3383,9 @@ class ControlPanel(GooglePhotosMixin, tk.Tk):
             return
 
         row = rows[index]
+        if row.get("type") == "folder":
+            self._show_folder_from_sidebar(str(row.get("name") or ""))
+            return
         self._reset_table_and_map_filters_for_scope_click()
         if row.get("type") == "face":
             self._active_face_person_id = row["id"]
@@ -3364,12 +3440,13 @@ class ControlPanel(GooglePhotosMixin, tk.Tk):
         if selection:
             index = int(selection[0])
             if 0 <= index < len(rows):
-                return rows[index]
+                # Renommer / supprimer / envoyer ne concernent que les albums (pas visages ni dossiers).
+                return rows[index] if rows[index].get("type") == "album" else None
 
         active_id = int(self._active_virtual_album_id or 0)
         if active_id > 0:
             for row in rows:
-                if int(row.get("id") or 0) == active_id:
+                if row.get("type") == "album" and int(row.get("id") or 0) == active_id:
                     return row
         return None
 
@@ -3383,6 +3460,9 @@ class ControlPanel(GooglePhotosMixin, tk.Tk):
         index = int(self.list_virtual_albums.nearest(event.y))
         if index < 0 or index >= self.list_virtual_albums.size():
             return "break"
+        rows = list(getattr(self, "_virtual_album_sidebar_rows", []))
+        if index >= len(rows) or rows[index].get("type") != "album":
+            return "break"  # menu des albums : sans objet pour un dossier ou un visage
 
         self._virtual_album_listbox_syncing = True
         try:
@@ -5982,6 +6062,14 @@ class ControlPanel(GooglePhotosMixin, tk.Tk):
         self.tree.see(target_iid)
         return "break"
 
+    def _on_tree_select_all(self, _event: tk.Event | None = None) -> str:
+        """Ctrl+A dans le tableau : sélectionne toutes les lignes affichées (la photo affichée ne change pas)."""
+        children = self.tree.get_children()
+        if children:
+            self._suspend_tree_select_once = True  # pas de réaffichage pour une sélection globale
+            self.tree.selection_set(children)
+        return "break"
+
     def _on_tree_page_up(self, _event: tk.Event) -> str:
         return self._move_tree_selection_by_page(-1)
 
@@ -8160,6 +8248,8 @@ class ControlPanel(GooglePhotosMixin, tk.Tk):
         self.tree.bind("<Delete>", lambda e: self.delete_current())
         self.tree.bind("<space>", lambda e: self.copy_current())
         self.tree.bind("<F2>", lambda e: self._rename_single())
+        self.tree.bind("<Control-a>", self._on_tree_select_all)
+        self.tree.bind("<Control-A>", self._on_tree_select_all)
         self.tree.bind("<Prior>", self._on_tree_page_up)
         self.tree.bind("<Next>", self._on_tree_page_down)
         self.tree.bind("<Page_Up>", self._on_tree_page_up)

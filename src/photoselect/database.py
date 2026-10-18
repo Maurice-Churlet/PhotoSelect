@@ -1366,6 +1366,18 @@ class Database:
         except sqlite3.Error:
             return 0
 
+    def get_directory_counts(self) -> dict[str, int]:
+        """Nombre de photos par nom de dossier parent (même clé que le filtre « Dossier= »)."""
+        counts: dict[str, int] = defaultdict(int)
+        try:
+            for (filepath,) in self._conn.execute("SELECT filepath FROM photos"):
+                name = Path(str(filepath or "")).parent.name
+                if name:
+                    counts[name] += 1
+        except sqlite3.Error as e:
+            logger.error("Erreur de lecture des dossiers : %s", e)
+        return dict(counts)
+
     def update_filepaths_batch(self, updates: list[tuple[str, int]]) -> None:
         """Met à jour les chemins de fichiers par lots (Utilisé pour migration absolu -> relatif)."""
         if not updates:

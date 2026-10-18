@@ -1,5 +1,17 @@
 # PhotoSelect — Fichier de Passation
 
+## Mise a jour — 18 octobre 2026 (soir : liste des dossiers, Ctrl+A)
+- Mode « Par dossier » : le cadre Albums devient « Dossiers (N) » (nom + nombre de photos, regroupement sur la
+  meme cle que le filtre `Dossier=` : sans accents, insensible a la casse). Un clic filtre le tableau sur ce
+  dossier et affiche sa premiere photo (`_refresh_folder_sidebar`, `_show_folder_from_sidebar`,
+  `Database.get_directory_counts`). Les autres modes retrouvent Albums / Visages.
+- Menu contextuel, renommer, supprimer et envoi Google Photos ne s'appliquent qu'aux lignes de type `album`.
+- Bug corrige : `_suppress_virtual_album_select_events` avalait un vrai clic dans la liste (Tk n'emet pas
+  `<<ListboxSelect>>` pour un `selection_set()` du programme). Cache de la liste Visages invalide quand le cadre
+  change de contenu.
+- Ctrl+A dans le tableau : selectionne toutes les lignes affichees, sans changer la photo affichee.
+- `a_faire.md` : demandes de Maurice, codees des qu'il demande du code, puis videes.
+
 ## Mise a jour — 18 octobre 2026 (envoi Google Photos)
 
 ### Contexte API (verifie)
