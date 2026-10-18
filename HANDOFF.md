@@ -1,5 +1,55 @@
 # PhotoSelect — Fichier de Passation
 
+## Mise a jour — 18 octobre 2026 (envoi Google Photos)
+
+### Contexte API (verifie)
+- Depuis le 31/03/2025, l'API Google Photos Library ne garde que `photoslibrary.appendonly`,
+  `photoslibrary.readonly.appcreateddata` et `photoslibrary.edit.appcreateddata`. `albums.share` et
+  `sharedAlbums.*` renvoient 403 : pas de partage programmatique. On envoie dans un album cree par
+  l'app, puis on ouvre `productUrl` pour que l'utilisateur partage dans Google Photos.
+
+### Ajouts
+- `src/photoselect/google_photos.py` (sans Tk) : OAuth bureau (`InstalledAppFlow`, port local
+  aleatoire), envoi brut `/v1/uploads` + `mediaItems:batchCreate` par lots de 50, creation/reutilisation
+  d'album (verifie par `albums.get`, recree s'il a ete supprime), retry 429/5xx avec backoff,
+  journal SQLite `%LOCALAPPDATA%\PhotoSelect\google_photos.db` (anti-doublon par chemin+taille+mtime+mode GPS+album).
+- GPS : `prepare_upload_bytes` travaille sur une copie en memoire (piexif). `keep` injecte le GPS de la
+  base si le JPEG n'en a pas ; `strip` retire l'IFD GPS ; un non-JPEG en mode `strip` est refuse
+  (jamais d'envoi silencieux de la position).
+- Secrets : client OAuth dans coffre `photoselect/google-photos-client` (paquet `coffre` si present,
+  sinon lecture directe `coffre:<nom>` via CredReadW, sinon `COFFRE_PHOTOSELECT__GOOGLE_PHOTOS_CLIENT`).
+  Jeton de rafraichissement ecrit par l'app sous `photoselect:google-photos-token` (hors espace coffre).
+  Aucune valeur secrete journalisee.
+- `src/photoselect/google_photos_ui.py` : mixin `GooglePhotosMixin` (ControlPanel en herite). Menus
+  tableau / visionneuses / albums virtuels, dialogue titre d'album + option GPS, fenetre de progression
+  annulable, thread de travail + file `queue` lue par `after()` (aucun appel Tk hors thread principal).
+- `app.py` : 3 modifications seulement (import, heritage, `_gphotos_install_menus()` apres `_build_ui`).
+- Dependances : `google-auth-oauthlib`, `requests` (pyproject ; requirements regenere par uv).
+
+### Tests
+- `tests/test_google_photos.py` : 17 tests hors ligne (HTTP simule) : GPS keep/strip, lots de 50,
+  reprise, album supprime cote Google, echecs partiels, 429, annulation, secrets absents/invalides.
+- Smoke test Tk sous Xvfb (mixin + dialogue) : OK. Non teste : vrai compte Google, build PyInstaller.
+
+### Verification et corrections (Claude Code, meme jour)
+- Environnement passe a uv : `uv.lock`, groupes `dev` (defaut) et `build` ; `requirements.txt` est desormais
+  genere par `uv export` (il lui manquait `send2trash`). VS Code pointe sur `.venv`, Ruff de l'extension en mode bundled.
+- Demarrage reel OK (33 547 photos) ; menus Google Photos presents (tableau, albums virtuels, 2 visionneuses).
+- Build PyInstaller OK sans hiddenimports (google_auth_oauthlib, google.auth, requests_oauthlib, certifi embarques).
+- Corrections apres relecture (Fable) :
+  - consentement avec `prompt="consent"` (sinon pas de refresh token apres « deconnecter » ou revocation) ;
+  - mode strip : segments XMP retires (GPS Lightroom/darktable), EXIF illisible ou non reecrivable => refus ;
+  - mode keep : EXIF illisible => fichier envoye tel quel (avant : EXIF entierement remplace, date perdue) ;
+  - refresh : seul `RefreshError` efface le jeton ; une coupure reseau le conserve ;
+  - `RefreshError` en cours d'envoi et HTTP 401/403 arretent tout l'envoi (`UploadReport.aborted`) au lieu de
+    6 tentatives par photo ; annulation prise en compte entre deux tentatives ;
+  - batchCreate retente seulement 429/503 (non idempotent) ; `get_album` teste `GooglePhotosError.status` ;
+  - consentement : erreurs (delai 180 s, refus, scope decoche) traduites ; Annuler pendant l'autorisation
+    libere l'interface ; avertissement avant envoi strip de fichiers non JPEG ;
+  - journaux `requests_oauthlib`/`oauthlib`/`urllib3` bridees a WARNING (jetons en clair en DEBUG) ;
+  - connexions SQLite fermees ; `poll()` tolere la fermeture de l'app.
+- 31 tests OK (26 Google Photos dont 9 de non-regression, 5 scaling). Reste : premier envoi reel par Maurice (voir README « Premier essai »).
+
 ## Mise a jour — 14 octobre 2026 (petits ecrans + bugs)
 
 ### Affichage / petits ecrans

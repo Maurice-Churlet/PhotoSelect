@@ -238,13 +238,54 @@ Une version exécutable autonome (`PhotoSelect.exe`) est disponible. Elle ne né
 - **Option EXIF dédiée** : lors du complément offline, une option séparée permet d'écrire (ou non) les métadonnées EXIF.
 - **Collage géolocalisation intelligent** : lors d'un collage GPS, PhotoSelect tente d'abord de compléter `Pays/Région/Ville` via recherche en ligne, puis en local si besoin, sans message d'erreur si les deux échouent.
 
+## Envoi vers Google Photos
+
+Clic droit **Envoyer vers Google Photos...** :
+- sur une sélection du tableau (multi-sélection) ;
+- sur la photo d'une visionneuse ;
+- sur un album virtuel de la colonne **Albums** (envoie tout l'album).
+
+Fonctionnement :
+- Les photos vont dans un album Google Photos portant le titre choisi. Un album déjà créé par PhotoSelect avec ce titre est complété ; sinon il est créé.
+- **Position GPS** : *Conserver* (si le fichier n'a pas de GPS mais la base en a un, il est ajouté à la copie envoyée) ou *Retirer* (recommandé avant un partage public). Les originaux ne sont jamais modifiés.
+- Le lieu (Ville, Région, Pays) est envoyé comme description de chaque photo.
+- Une photo déjà envoyée dans le même album (même fichier, même option GPS) est ignorée.
+- **Partage** : depuis mars 2025, Google n'autorise plus les applications tierces à partager un album. À la fin de l'envoi, PhotoSelect propose d'ouvrir l'album dans le navigateur : cliquer sur **Partager** dans Google Photos.
+- Clic droit sur le tableau → **Google Photos : déconnecter le compte** oublie l'autorisation locale.
+
+### Mise en place (une seule fois)
+1. [Google Cloud Console](https://console.cloud.google.com/) : créer un projet, puis activer **Photos Library API**.
+2. **Écran de consentement OAuth** : type *Externe*, ajouter son adresse Gmail comme utilisateur test. Passer l'application en **Production** évite l'expiration de l'autorisation tous les 7 jours (Google affiche alors un avertissement « application non validée », normal pour un usage personnel).
+3. **Identifiants → Créer un ID client OAuth → Application de bureau**, puis télécharger le JSON.
+4. Dans un terminal : `coffre definir photoselect/google-photos-client`, puis coller le contenu du JSON.
+5. Premier envoi : le navigateur s'ouvre pour autoriser PhotoSelect. Le jeton est conservé dans le Gestionnaire d'identifiants Windows (`photoselect:google-photos-token`).
+
+Journal local des envois : `%LOCALAPPDATA%\PhotoSelect\google_photos.db`.
+
+### Premier essai (conseillé)
+1. Créer dans PhotoSelect un album virtuel de test contenant **une seule** photo JPEG.
+2. Clic droit sur l'album → **Envoyer l'album vers Google Photos...**, titre `Test PhotoSelect`, option *Retirer*.
+3. Dans le navigateur : choisir le compte, passer l'avertissement « application non validée » (*Paramètres avancés → Accéder à …*), **cocher toutes les autorisations** demandées.
+4. Vérifier dans Google Photos : album présent, photo sans position (*Infos* ⓘ), lieu en description.
+5. Relancer le même envoi : le bilan doit indiquer « Déjà présentes dans l'album : 1 ».
+
+Problèmes connus :
+- « Google n'a pas fourni de jeton de rafraîchissement » ou autorisation redemandée chaque semaine : l'application OAuth est restée en mode *Test* (jetons valables 7 jours). La passer en *Production* (étape 2 ci-dessus).
+- En mode *Retirer*, les fichiers non JPEG (HEIC, PNG, RAW) ne sont pas envoyés : PhotoSelect ne sait pas en retirer le GPS.
+- Le retrait du GPS supprime aussi le bloc XMP de la copie envoyée (mots-clés, notes Lightroom) ; l'EXIF (date, appareil) est conservé.
+
 ## Installation & Lancement (Version développeur)
 
 L'application repose sur le langage Python et certaines dépendances de lectures natives et géographiques (comme `Pillow` et `reverse_geocoder`).
 
-1. Mettre en place un environnement virtuel (optionnel mais conseillé).
-2. Installer les paquets via `pip install -r requirements.txt`.
-3. Lancer l'interface en saisissant la commande :
+Les dépendances sont déclarées dans `pyproject.toml` et figées dans `uv.lock` (gestionnaire [uv](https://docs.astral.sh/uv/)).
+
+1. Créer ou mettre à jour l'environnement `.venv` : `uv sync` (ajouter `--group build` pour PyInstaller).
+2. Lancer l'interface : `uv run python -m photoselect`
+3. Tests : `uv run pytest tests`
+4. Exécutable : `uv run python -m PyInstaller --noconfirm PhotoSelect.spec`
+
+Ajouter une dépendance : `uv add <paquet>`, puis régénérer `requirements.txt` (fourni pour un usage sans uv, ne pas l'éditer à la main) :
 ```bash
-python -m photoselect
+uv export --format requirements-txt --no-hashes --no-dev --group build --no-emit-project -o requirements.txt
 ```

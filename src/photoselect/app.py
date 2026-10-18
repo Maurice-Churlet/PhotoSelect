@@ -62,6 +62,7 @@ from photoselect.file_manager import (
 )
 from photoselect.theme_engine import classify_themes_from_image, get_theme_engine_status
 from photoselect.ui_scaling import AppScaler
+from photoselect.google_photos_ui import GooglePhotosMixin
 
 try:
     from watchdog.observers import Observer
@@ -1988,7 +1989,7 @@ else:
     class PhotoWatcher: # Fallback dummy
         def __init__(self, *args, **kwargs): pass
 
-class ControlPanel(tk.Tk):
+class ControlPanel(GooglePhotosMixin, tk.Tk):
     """Panneau de contrôle principal (Fenêtre fixe)."""
     
     def __init__(self) -> None:
@@ -2205,6 +2206,10 @@ class ControlPanel(tk.Tk):
         self._set_style()
         self._build_ui()
         self._init_photo_orientation_menu()
+        try:
+            self._gphotos_install_menus()
+        except Exception:
+            logger.exception("[gphotos] installation des menus impossible")
         self._set_ui_initializing_state(True)
         
         # Activer le suivi du redimensionnement pour l'homothétie

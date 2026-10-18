@@ -20,16 +20,22 @@ dependencies = [
     "send2trash>=1.8",
     "mediapipe>=0.10.14",
     "opencv-python>=4.10.0",
+    "google-auth-oauthlib>=1.2",
+    "requests>=2.31",
 ]
 
-[project.optional-dependencies]
-build = [
-    "pyinstaller>=6.0",
-]
+[dependency-groups]
+# `uv sync` installe "dev" par défaut ; `uv sync --group build` ajoute PyInstaller.
 dev = [
     "pytest>=7.0",
     "ruff>=0.4",
 ]
+build = [
+    "pyinstaller>=6.0",
+]
+
+[tool.uv]
+default-groups = ["dev"]
 
 [project.scripts]
 photoselect = "photoselect.app:main"
